@@ -48,7 +48,9 @@ process EXTRACT_SAMPLE_INFO {
 
     script:
     """
-    awk 'NR > 1 {print \$2 "\t" \$7}' ${ped_file} > samples.pop
+    # Ensure clean tab-separated output with proper header
+    echo -e "Individual_ID\tPopulation" > samples.pop
+    awk -F'\t' 'NR > 1 {print \$2 "\t" \$7}' ${ped_file} | tr -s ' ' '\t' >> samples.pop
     """
 }
 
@@ -231,6 +233,7 @@ process LD_PRUNE {
         --threads ${task.cpus} \
         --set-all-var-ids '@:#:\$r:\$a' \
         --new-id-max-allele-len 97 \
+        --snps-only \
         --max-alleles 2 \
         --chr ${params.chromosomes} \
         --make-bed \
@@ -240,6 +243,7 @@ process LD_PRUNE {
     echo "Running LD pruning..."
     plink2 --bfile temp_initial \
         --threads ${task.cpus} \
+        --snps-only \
         --indep-pairwise ${params.ld_window_size} ${params.ld_step_size} ${params.ld_r2_threshold} \
         --out pruned
 
@@ -390,12 +394,17 @@ process CREATE_PCA_PLOT {
     path sample_info
 
     output:
-    path '*.pdf'
-    path 'debug_info.txt'
+    path '*_PC*.pdf'
+    path '*_debug.txt'
 
     script:
     """
-    Rscript ${baseDir}/bin/plot_pca.R pca.eigenvec ${sample_info}
+    Rscript ${baseDir}/bin/plot_pca.R \
+        --pca-file pca.eigenvec \
+        --eigenval-file pca.eigenval \
+        --sample-info ${sample_info} \
+        --pop-info ${baseDir}/igsr_populations.tsv \
+        --output-prefix pca_plot
     """
 }
 
@@ -752,6 +761,92 @@ process QC_CHECK_FINAL_MERGED {
     """
 }
 
+process CREATE_PCA_DATA_FILE {
+    publishDir params.outdir, mode: 'copy'
+
+    input:
+    path(pca_results)
+    path(sample_info)
+    path(pop_info)
+
+    output:
+    path 'pca_data.json'
+
+    script:
+    """
+    #!/usr/bin/env Rscript
+
+    # Load required libraries
+    if (!requireNamespace("jsonlite", quietly = TRUE)) {
+        install.packages("jsonlite", repos="https://cloud.r-project.org")
+    }
+    library(jsonlite)
+
+    # Read PCA results - use pca.eigenvec file
+    pca <- read.table("pca.eigenvec", header=FALSE)
+    colnames(pca) <- c("FID", "IID", paste0("PC", 1:10))
+
+    # Read sample info
+    samples <- read.table("${sample_info}", header=TRUE, sep="\t")
+
+    # Read population info
+    pop_info <- read.delim("${pop_info}")
+
+    # Print column names for debugging
+    cat("Population info columns:", paste(colnames(pop_info), collapse=", "), "\n")
+
+    # Split modern and ancient samples
+    is_ancient <- grepl("^ancient", pca\$IID)
+    modern_pca <- pca[!is_ancient,]
+    ancient_pca <- pca[is_ancient,]
+
+    # Process modern samples
+    modern_pca\$IID <- gsub("_.*\$", "", modern_pca\$IID)
+    modern_data <- merge(modern_pca, samples, by.x="IID", by.y="Individual_ID", all.x=TRUE)
+    modern_data <- merge(modern_data, 
+                        pop_info[, c("Population.code", "Population.name", 
+                                    "Superpopulation.code", "Superpopulation.name",
+                                    "Superpopulation.display.colour")],
+                        by.x="Population", 
+                        by.y="Population.code", 
+                        all.x=TRUE)
+
+    # Create modern samples data structure
+    modern_final <- data.frame(
+        sample = modern_data\$IID,
+        population = modern_data\$Population,
+        pop_name = modern_data\$Population.name,
+        superpop = modern_data\$Superpopulation.code,
+        superpop_name = modern_data\$Superpopulation.name,
+        color = modern_data\$Superpopulation.display.colour,
+        is_ancient = FALSE,
+        PC1 = modern_data\$PC1,
+        PC2 = modern_data\$PC2,
+        PC3 = modern_data\$PC3
+    )
+
+    # Create ancient samples data structure
+    ancient_final <- data.frame(
+        sample = ancient_pca\$IID,
+        population = "Ancient",
+        pop_name = "Ancient Sample",
+        superpop = "ANC",
+        superpop_name = "Ancient Samples",
+        color = "#000000",  # Black color for ancient samples
+        is_ancient = TRUE,
+        PC1 = ancient_pca\$PC1,
+        PC2 = ancient_pca\$PC2,
+        PC3 = ancient_pca\$PC3
+    )
+
+    # Combine modern and ancient data
+    final_data <- rbind(modern_final, ancient_final)
+
+    # Write to JSON
+    writeLines(toJSON(final_data, pretty=TRUE), "pca_data.json")
+    """
+}
+
 workflow {
     // Parse chromosome list and create debug view
     def chromosomes = Channel.fromList(
@@ -850,6 +945,13 @@ workflow {
     CREATE_PCA_PLOT(
         RUN_PCA.out.pca_results,
         EXTRACT_SAMPLE_INFO.out.sample_info
+    )
+
+    // Create PCA data file
+    CREATE_PCA_DATA_FILE(
+        RUN_PCA.out.pca_results,
+        EXTRACT_SAMPLE_INFO.out.sample_info,
+        Channel.fromPath("${baseDir}/igsr_populations.tsv")
     )
 }
 
