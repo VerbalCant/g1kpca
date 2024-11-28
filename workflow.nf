@@ -3,18 +3,19 @@
 nextflow.enable.dsl=2
 
 // Define parameters
-params.thousand_genomes_vcf = "/references/1000genomes/ALL.chr1.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz"
+params.thousand_genomes_vcf = "/references/1000genomes/ALL.chr{chr}.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz"
 params.ancient_vcfs = "/project/1kg_nazca/data/ancient*.unifiedgenotyper.vcf.gz"
+params.ped_file = "20130606_g1k.ped"
 params.outdir = 'results'
-params.min_maf = 0.05
-params.max_missing = 0.05
+params.min_maf = 0.01
+params.max_missing = 0.1
 params.ld_window_size = '50'
 params.ld_step_size = '10'
 params.ld_r2_threshold = '0.2'
 params.max_cpus = 16
 params.chromosomes = "1"  // Default to chr1, can be specified as "1,2,3" or "1-22"
 params.timing_report = "${params.outdir}/timing_report.txt"
-params.min_variants = 100
+params.min_variants = 50
 params.max_missing_rate = 0.1
 params.min_samples = 1
 
@@ -37,35 +38,17 @@ ancient_ch = Channel.fromPath(params.ancient_vcfs)
 
 // Create a process to extract sample information from 1000G VCF
 process EXTRACT_SAMPLE_INFO {
-    container 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
     publishDir params.outdir, mode: 'copy'
-    cpus params.max_cpus
 
     input:
-    path vcf
+    path ped_file
 
     output:
     path 'samples.pop', emit: sample_info
 
     script:
     """
-    # Get sample IDs
-    bcftools query -l ${vcf} > samples.txt
-
-    # Create population assignments based on sample naming convention
-    while read sample; do
-        if [[ \$sample =~ ^ancient ]]; then
-            echo -e "\${sample}\tANCIENT"
-        elif [[ \$sample =~ ^HG ]]; then
-            pop=\$(echo \$sample | cut -c1-5)
-            echo -e "\${sample}\t\${pop}"
-        elif [[ \$sample =~ ^NA ]]; then
-            pop=\$(echo \$sample | cut -c1-4)
-            echo -e "\${sample}\t\${pop}"
-        else
-            echo -e "\${sample}\tUNKNOWN"
-        fi
-    done < samples.txt > samples.pop
+    awk 'NR > 1 {print \$2 "\t" \$7}' ${ped_file} > samples.pop
     """
 }
 
@@ -107,22 +90,25 @@ process MERGE_ANCIENT_SAMPLES {
     start_time=\$(date +%s)
     echo "Start time: \$(date)"
     
-    # Create a list of VCF files with unique names
-    for vcf in *.vcf.gz; do
-        # Create symbolic links with unique names based on the full path
-        ln -s \$vcf \$(echo \$vcf | md5sum | cut -d' ' -f1).vcf.gz
-    done
+    # Create a directory for uniquely named links
+    mkdir -p unique_vcfs
     
-    # Create a list of the uniquely named VCF files
-    ls -1 *.md5sum.vcf.gz > vcf_list.txt
+    # Create uniquely named symbolic links
+    counter=1
+    for vcf in *.vcf.gz; do
+        unique_name="unique_vcfs/\${counter}_\${vcf}"
+        ln -s "../\${vcf}" "\${unique_name}"
+        echo "\${unique_name}" >> vcf_list.txt
+        counter=\$((counter + 1))
+    done
 
     # Index VCF files only if they don't have an index
-    for vcf in *.md5sum.vcf.gz; do
+    while read vcf; do
         if [ ! -f \$vcf.tbi ] && [ ! -f \$vcf.csi ]; then
             echo "Indexing \$vcf"
             bcftools index --threads ${task.cpus} \$vcf
         fi
-    done
+    done < vcf_list.txt
 
     # Merge all ancient samples
     echo "Command: bcftools merge --threads ${task.cpus} --file-list vcf_list.txt --missing-to-ref -Oz -o merged_ancient.vcf.gz"
@@ -144,6 +130,8 @@ process MERGE_ANCIENT_SAMPLES {
     echo "End time: \$(date -d @\${end_time})" >> timing.txt
     echo "Runtime: \${runtime} seconds" >> timing.txt
     echo "Command: bcftools merge --threads ${task.cpus} --file-list vcf_list.txt --missing-to-ref -Oz -o merged_ancient.vcf.gz" >> timing.txt
+    echo "Files merged:" >> timing.txt
+    cat vcf_list.txt >> timing.txt
     echo "---" >> timing.txt
     """
 }
@@ -158,24 +146,52 @@ process MERGE_WITH_1KG {
 
     output:
     path 'merged_final.vcf.gz', emit: vcf
+    path 'timing.txt', emit: timing
 
     script:
     """
+    start_time=\$(date +%s)
+    
+    # Create local copy of 1000G VCF and index it
+    echo "Creating local copy of 1000G VCF..."
+    cp ${thousand_genomes_vcf} ./1kg.vcf.gz
+    
+    # Index both VCFs if needed
+    echo "Indexing VCFs..."
+    bcftools index --threads ${task.cpus} ./1kg.vcf.gz
+    
+    if [ ! -f ${ancient_vcf}.tbi ] && [ ! -f ${ancient_vcf}.csi ]; then
+        bcftools index --threads ${task.cpus} ${ancient_vcf}
+    fi
+
     # Merge with 1000 Genomes
+    echo "Merging VCFs..."
     bcftools merge \
         --threads ${task.cpus} \
         --missing-to-ref \
-        --regions 1 \
+        --regions ${params.chromosomes} \
         -Oz -o merged_final.vcf.gz \
-        ${thousand_genomes_vcf} \
+        ./1kg.vcf.gz \
         ${ancient_vcf}
 
     bcftools index --threads ${task.cpus} merged_final.vcf.gz
+
+    # End timing
+    end_time=\$(date +%s)
+    runtime=\$((end_time-start_time))
+    
+    # Write timing report
+    echo "Process: MERGE_WITH_1KG" > timing.txt
+    echo "Start time: \$(date -d @\${start_time})" >> timing.txt
+    echo "End time: \$(date -d @\${end_time})" >> timing.txt
+    echo "Runtime: \${runtime} seconds" >> timing.txt
+    echo "Command: bcftools merge --threads ${task.cpus} --missing-to-ref --regions ${params.chromosomes} -Oz -o merged_final.vcf.gz" >> timing.txt
+    echo "1000G VCF: ${thousand_genomes_vcf}" >> timing.txt
+    echo "Ancient VCF: ${ancient_vcf}" >> timing.txt
     """
 }
 
 process LD_PRUNE {
-    container 'quay.io/biocontainers/plink2:2.00a5.12--h4ac6f70_0'
     cpus params.max_cpus
 
     input:
@@ -183,32 +199,84 @@ process LD_PRUNE {
 
     output:
     path 'pruned.vcf.gz', emit: vcf
+    path 'timing.txt', emit: timing
 
     script:
     """
+    start_time=\$(date +%s)
+    echo "Starting LD pruning at \$(date)"
+
+    # Index VCF if needed
+    if [ ! -f ${vcf}.tbi ] && [ ! -f ${vcf}.csi ]; then
+        echo "Indexing input VCF..."
+        bcftools index --tbi ${vcf}
+    fi
+
     # Convert to plink format and perform LD pruning
-    plink2 --vcf ${vcf} \
+    echo "Step 1: LD pruning"
+    echo "Input VCF: ${vcf}"
+    ls -l ${vcf}
+    
+    # Filter out variants with long alleles using bcftools with expression
+    echo "Filtering variants with long alleles..."
+    bcftools view ${vcf} \
+        --include 'strlen(REF)<=100 & strlen(ALT)<=100' \
+        -Oz -o filtered_variants.vcf.gz
+
+    bcftools index filtered_variants.vcf.gz
+
+    # First pass: Convert to PLINK format with unique IDs
+    echo "Converting to PLINK format with unique IDs..."
+    plink2 --vcf filtered_variants.vcf.gz \
+        --threads ${task.cpus} \
+        --set-all-var-ids '@:#:\$r:\$a' \
+        --new-id-max-allele-len 97 \
+        --max-alleles 2 \
+        --chr ${params.chromosomes} \
+        --make-bed \
+        --out temp_initial
+
+    # Now run LD pruning on the bed file
+    echo "Running LD pruning..."
+    plink2 --bfile temp_initial \
         --threads ${task.cpus} \
         --indep-pairwise ${params.ld_window_size} ${params.ld_step_size} ${params.ld_r2_threshold} \
-        --allow-extra-chr \
-        --set-missing-var-ids @:#,\\\$1,\\\$2 \
-        --max-alleles 2 \
         --out pruned
 
+    # Check if pruning was successful
+    if [ ! -f pruned.prune.in ]; then
+        echo "Error: LD pruning failed to produce output file"
+        exit 1
+    fi
+
     # Extract pruned variants
-    plink2 --vcf ${vcf} \
+    echo "Step 2: Extracting pruned variants"
+    plink2 --bfile temp_initial \
         --threads ${task.cpus} \
         --extract pruned.prune.in \
         --recode vcf bgz \
         --out pruned \
-        --allow-extra-chr \
-        --set-missing-var-ids @:#,\\\$1,\\\$2 \
-        --max-alleles 2
+        --double-id
+
+    # End timing
+    end_time=\$(date +%s)
+    runtime=\$((end_time-start_time))
+    
+    # Write timing report
+    echo "Process: LD_PRUNE" > timing.txt
+    echo "Start time: \$(date -d @\${start_time})" >> timing.txt
+    echo "End time: \$(date -d @\${end_time})" >> timing.txt
+    echo "Runtime: \${runtime} seconds" >> timing.txt
+    echo "Parameters:" >> timing.txt
+    echo "  Window size: ${params.ld_window_size}" >> timing.txt
+    echo "  Step size: ${params.ld_step_size}" >> timing.txt
+    echo "  R2 threshold: ${params.ld_r2_threshold}" >> timing.txt
+    echo "Input VCF stats:" >> timing.txt
+    bcftools stats ${vcf} | grep "^SN" >> timing.txt
     """
 }
 
 process RUN_PCA {
-    container 'quay.io/biocontainers/plink2:2.00a5.12--h4ac6f70_0'
     publishDir params.outdir, mode: 'copy'
     cpus params.max_cpus
 
@@ -217,15 +285,99 @@ process RUN_PCA {
 
     output:
     path 'pca.*', emit: pca_results
+    path 'debug_*', emit: debug
 
     script:
     """
+    # First check input VCF
+    echo "Checking input VCF..."
+    bcftools stats ${vcf} > debug_vcf_stats.txt
+
+    # Convert VCF to PLINK format with minimal filtering first
+    echo "Converting to PLINK format..."
     plink2 --vcf ${vcf} \
         --threads ${task.cpus} \
-        --pca approx \
+        --make-bed \
         --allow-extra-chr \
         --set-missing-var-ids @:#,\\\$1,\\\$2 \
+        --max-alleles 2 \
+        --out temp_plink_initial
+
+    # Check initial conversion
+    echo "Initial PLINK conversion stats:" > debug_plink_steps.txt
+    wc -l temp_plink_initial.bim >> debug_plink_steps.txt
+    wc -l temp_plink_initial.fam >> debug_plink_steps.txt
+
+    # Now do filtering steps one at a time
+    echo "Filtering steps:" >> debug_plink_steps.txt
+
+    # Step 1: Filter by missingness with a more lenient threshold
+    plink2 --bfile temp_plink_initial \
+        --threads ${task.cpus} \
+        --geno 0.2 \
+        --mind 0.2 \
+        --make-bed \
+        --out temp_plink_missing
+    echo "After missingness filtering:" >> debug_plink_steps.txt
+    wc -l temp_plink_missing.bim >> debug_plink_steps.txt
+
+    # Step 2: Filter by MAF with a much lower threshold
+    plink2 --bfile temp_plink_missing \
+        --threads ${task.cpus} \
+        --maf 0.001 \
+        --make-bed \
+        --out temp_plink_final
+    echo "After MAF filtering:" >> debug_plink_steps.txt
+    wc -l temp_plink_final.bim >> debug_plink_steps.txt
+
+    # Check the number of variants and samples
+    n_variants=\$(wc -l < temp_plink_final.bim)
+    n_samples=\$(wc -l < temp_plink_final.fam)
+    echo "Final counts:" >> debug_plink_steps.txt
+    echo "Variants: \$n_variants" >> debug_plink_steps.txt
+    echo "Samples: \$n_samples" >> debug_plink_steps.txt
+
+    if [ \$n_variants -lt ${params.min_variants} ]; then
+        echo "Error: Too few variants (\$n_variants) after filtering"
+        exit 1
+    fi
+
+    if [ \$n_samples -lt ${params.min_samples} ]; then
+        echo "Error: Too few samples (\$n_samples) after filtering"
+        exit 1
+    fi
+
+    # Run PCA with allele weights for multiallelic variants
+    plink2 --bfile temp_plink_final \
+        --threads ${task.cpus} \
+        --pca allele-wts approx \
+        --allow-extra-chr \
         --out pca
+
+    # Verify PCA output
+    if [ ! -f pca.eigenvec ] || [ ! -f pca.eigenval ]; then
+        echo "Error: PCA failed to produce output files"
+        exit 1
+    fi
+
+    # Check eigenvalues
+    head -n 10 pca.eigenval > debug_eigenvalues.txt
+
+    # Check first few lines of eigenvectors
+    head -n 10 pca.eigenvec > debug_eigenvectors.txt
+
+    # Check for variation in eigenvectors
+    Rscript -e '
+        pca <- read.table("pca.eigenvec", header=TRUE)
+        pc1_var <- var(pca[,3])
+        pc2_var <- var(pca[,4])
+        cat(sprintf("PC1 variance: %g\\n", pc1_var), file="debug_pc_variance.txt")
+        cat(sprintf("PC2 variance: %g\\n", pc2_var), file="debug_pc_variance.txt")
+        if (pc1_var < 1e-10 || pc2_var < 1e-10) {
+            cat("Error: No variation in principal components\\n")
+            quit(status=1)
+        }
+    '
     """
 }
 
@@ -239,58 +391,11 @@ process CREATE_PCA_PLOT {
 
     output:
     path '*.pdf'
+    path 'debug_info.txt'
 
     script:
     """
-    #!/usr/bin/env Rscript
-
-    # Read PCA results and sample information
-    pca <- read.table("pca.eigenvec", header=FALSE)
-    samples <- read.table("${sample_info}", header=FALSE)
-
-    # Merge population information
-    pca\$Population <- samples\$V2[match(pca\$V2, samples\$V1)]
-
-    # Create plot
-    pdf("pca_plot.pdf", width=10, height=8)
-
-    # Define colors for different populations
-    colors <- c(
-        "ANCIENT"="red",
-        "HG00"="blue",
-        "HG01"="green",
-        "HG02"="purple",
-        "NA18"="orange",
-        "NA19"="brown",
-        "NA20"="cyan",
-        "UNKNOWN"="gray"
-    )
-
-    # Plot PC1 vs PC2
-    plot(pca\$V3, pca\$V4,
-         col=colors[substr(pca\$Population, 1, 4)],
-         pch=20,
-         xlab="PC1",
-         ylab="PC2",
-         main="PCA of Ancient and 1000G Samples")
-
-    # Add legend
-    legend("topright",
-           legend=names(colors),
-           col=colors,
-           pch=20,
-           title="Population",
-           cex=0.8)
-
-    # Add special labels for ancient samples
-    ancient_idx <- which(pca\$Population == "ANCIENT")
-    text(pca\$V3[ancient_idx],
-         pca\$V4[ancient_idx],
-         labels=pca\$V2[ancient_idx],
-         pos=3,
-         cex=0.6)
-
-    dev.off()
+    Rscript ${baseDir}/bin/plot_pca.R pca.eigenvec ${sample_info}
     """
 }
 
@@ -507,7 +612,7 @@ process QC_CHECK_EXTRACTED {
     """
 }
 
-process QC_CHECK_MERGED {
+process QC_CHECK_ANCIENT_MERGED {
     container 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
     cpus 1
 
@@ -521,7 +626,129 @@ process QC_CHECK_MERGED {
 
     script:
     """
-    # Same script as QC_CHECK_INPUT
+    # Start QC report
+    echo "QC Report for ${stage_name}" > ${stage_name}_qc_report.txt
+    echo "VCF file: ${vcf}" >> ${stage_name}_qc_report.txt
+    echo "Date: \$(date)" >> ${stage_name}_qc_report.txt
+    echo "-------------------" >> ${stage_name}_qc_report.txt
+
+    # Index VCF only if no index exists
+    if [ ! -f ${vcf}.tbi ] && [ ! -f ${vcf}.csi ]; then
+        bcftools index --tbi ${vcf}
+    fi
+
+    # Check if file exists and is not empty
+    if [ ! -s ${vcf} ]; then
+        echo "ERROR: VCF file is empty" >> ${stage_name}_qc_report.txt
+        touch FAIL
+        exit 0
+    fi
+
+    # Get basic stats
+    echo "Basic Statistics:" >> ${stage_name}_qc_report.txt
+    bcftools stats ${vcf} | grep "^SN" >> ${stage_name}_qc_report.txt
+
+    # Get number of variants
+    variants=\$(bcftools view -H ${vcf} | wc -l)
+    echo "Number of variants: \$variants" >> ${stage_name}_qc_report.txt
+
+    # Get number of samples
+    samples=\$(bcftools query -l ${vcf} | wc -l)
+    echo "Number of samples: \$samples" >> ${stage_name}_qc_report.txt
+
+    # Check for minimum number of variants
+    if [ \$variants -lt ${params.min_variants} ]; then
+        echo "ERROR: Too few variants (\$variants < ${params.min_variants})" >> ${stage_name}_qc_report.txt
+        touch FAIL
+        exit 0
+    fi
+
+    # Check for minimum number of samples
+    if [ \$samples -lt ${params.min_samples} ]; then
+        echo "ERROR: Too few samples (\$samples < ${params.min_samples})" >> ${stage_name}_qc_report.txt
+        touch FAIL
+        exit 0
+    fi
+
+    # Check for biallelic sites
+    multiallelic=\$(bcftools view -H ${vcf} | cut -f 4,5 | grep ',' | wc -l)
+    echo "Number of multiallelic sites: \$multiallelic" >> ${stage_name}_qc_report.txt
+
+    # Check for variant types
+    echo "Variant types:" >> ${stage_name}_qc_report.txt
+    bcftools view -H ${vcf} | cut -f 4,5 | awk '{len1=length(\$1); len2=length(\$2); if(len1==1 && len2==1) print "SNP"; else if(len1>len2) print "DEL"; else if(len1<len2) print "INS"; else print "OTHER"}' | sort | uniq -c >> ${stage_name}_qc_report.txt
+
+    echo "QC check completed successfully" >> ${stage_name}_qc_report.txt
+    """
+}
+
+process QC_CHECK_FINAL_MERGED {
+    container 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
+    cpus 1
+
+    input:
+    path vcf
+    val stage_name
+
+    output:
+    path "${stage_name}_qc_report.txt", emit: report
+    path "FAIL", optional: true, emit: fail_flag
+
+    script:
+    """
+    # Start QC report
+    echo "QC Report for ${stage_name}" > ${stage_name}_qc_report.txt
+    echo "VCF file: ${vcf}" >> ${stage_name}_qc_report.txt
+    echo "Date: \$(date)" >> ${stage_name}_qc_report.txt
+    echo "-------------------" >> ${stage_name}_qc_report.txt
+
+    # Index VCF only if no index exists
+    if [ ! -f ${vcf}.tbi ] && [ ! -f ${vcf}.csi ]; then
+        bcftools index --tbi ${vcf}
+    fi
+
+    # Check if file exists and is not empty
+    if [ ! -s ${vcf} ]; then
+        echo "ERROR: VCF file is empty" >> ${stage_name}_qc_report.txt
+        touch FAIL
+        exit 0
+    fi
+
+    # Get basic stats
+    echo "Basic Statistics:" >> ${stage_name}_qc_report.txt
+    bcftools stats ${vcf} | grep "^SN" >> ${stage_name}_qc_report.txt
+
+    # Get number of variants
+    variants=\$(bcftools view -H ${vcf} | wc -l)
+    echo "Number of variants: \$variants" >> ${stage_name}_qc_report.txt
+
+    # Get number of samples
+    samples=\$(bcftools query -l ${vcf} | wc -l)
+    echo "Number of samples: \$samples" >> ${stage_name}_qc_report.txt
+
+    # Check for minimum number of variants
+    if [ \$variants -lt ${params.min_variants} ]; then
+        echo "ERROR: Too few variants (\$variants < ${params.min_variants})" >> ${stage_name}_qc_report.txt
+        touch FAIL
+        exit 0
+    fi
+
+    # Check for minimum number of samples
+    if [ \$samples -lt ${params.min_samples} ]; then
+        echo "ERROR: Too few samples (\$samples < ${params.min_samples})" >> ${stage_name}_qc_report.txt
+        touch FAIL
+        exit 0
+    fi
+
+    # Check for biallelic sites
+    multiallelic=\$(bcftools view -H ${vcf} | cut -f 4,5 | grep ',' | wc -l)
+    echo "Number of multiallelic sites: \$multiallelic" >> ${stage_name}_qc_report.txt
+
+    # Check for variant types
+    echo "Variant types:" >> ${stage_name}_qc_report.txt
+    bcftools view -H ${vcf} | cut -f 4,5 | awk '{len1=length(\$1); len2=length(\$2); if(len1==1 && len2==1) print "SNP"; else if(len1>len2) print "DEL"; else if(len1<len2) print "INS"; else print "OTHER"}' | sort | uniq -c >> ${stage_name}_qc_report.txt
+
+    echo "QC check completed successfully" >> ${stage_name}_qc_report.txt
     """
 }
 
@@ -529,40 +756,45 @@ workflow {
     // Parse chromosome list and create debug view
     def chromosomes = Channel.fromList(
         expandChromosomeList(params.chromosomes)
-    ).view { "DEBUG: Chromosome before combine: $it" }
+    ).view { "DEBUG: Processing chromosome: $it" }
     
+    // Create the 1000G VCF path with the correct chromosome
+    def kg_vcf = chromosomes.map { chr ->
+        def vcf_path = params.thousand_genomes_vcf.replace("{chr}", chr)
+        [chr, file(vcf_path)]
+    }.view { "DEBUG: 1000G VCF for chr${it[0]}: ${it[1]}" }
+
     // Create ancient VCFs channel with debug view
     def ancient_vcfs = Channel.fromPath(params.ancient_vcfs)
         .view { "DEBUG: Ancient VCF before combine: $it" }
 
-    // QC check on input ancient VCFs
+    // Extract sample info from PED file
+    EXTRACT_SAMPLE_INFO(
+        Channel.fromPath("20130606_g1k.ped")
+    )
+
+    // QC and process ancient VCFs by chromosome
     QC_CHECK_INPUT(ancient_vcfs, "input_ancient_vcfs")
     
-    // Branch based on QC results
-    QC_CHECK_INPUT.out.report
+    def qc_results = QC_CHECK_INPUT.out.report
         .combine(ancient_vcfs)
         .branch {
             pass: !it[0].text.contains("ERROR")
             fail: it[0].text.contains("ERROR")
         }
-        .set { qc_results }
 
-    // Create the combined channel with debug view
     def combined_ch = qc_results.pass
         .map { report, vcf -> vcf }
         .combine(chromosomes)
         .view { "DEBUG: Combined channel: $it" }
 
-    // Extract chromosomes from ancient VCFs
     EXTRACT_CHROMOSOMES(
-        combined_ch.map { vcf, chr -> vcf }.view { "DEBUG: VCF input: $it" },
-        combined_ch.map { vcf, chr -> chr }.view { "DEBUG: Chr input: $it" }
+        combined_ch.map { vcf, chr -> vcf },
+        combined_ch.map { vcf, chr -> chr }
     )
     
-    // QC check on extracted chromosomes
     QC_CHECK_EXTRACTED(EXTRACT_CHROMOSOMES.out.vcf, "post_extract_chromosomes")
 
-    // Group extracted VCFs by chromosome and collect them, ensuring uniqueness
     def grouped_vcfs = EXTRACT_CHROMOSOMES.out.vcf
         .map { vcf -> 
             def chr = vcf.name.find(/chr(\d+)/)
@@ -570,25 +802,29 @@ workflow {
         }
         .groupTuple()
         .map { chr, files -> 
-            // Deduplicate files based on their base names
             def uniqueFiles = files.unique { it.name }
             [chr, uniqueFiles]
         }
-        .view { "DEBUG: Grouped VCFs (deduplicated): $it" }
 
-    // Merge ancient samples by chromosome
     MERGE_ANCIENT_SAMPLES(
         grouped_vcfs.map { chr, files -> files }
     )
 
-    // QC check on merged ancient samples
-    QC_CHECK_MERGED(MERGE_ANCIENT_SAMPLES.out.vcf, "post_merge_ancient")
+    QC_CHECK_ANCIENT_MERGED(MERGE_ANCIENT_SAMPLES.out.vcf, "post_merge_ancient")
+
+    // Merge with 1000G by chromosome
+    MERGE_WITH_1KG(
+        kg_vcf.map { chr, vcf -> vcf },
+        MERGE_ANCIENT_SAMPLES.out.vcf
+    )
+
+    QC_CHECK_FINAL_MERGED(MERGE_WITH_1KG.out.vcf, "post_1kg_merge")
 
     // Collect timing reports
     def timing_ch = EXTRACT_CHROMOSOMES.out.timing
         .mix(MERGE_ANCIENT_SAMPLES.out.timing)
+        .mix(MERGE_WITH_1KG.out.timing)
         .collect()
-        .view { "DEBUG: Collected timing reports: $it" }
 
     // Generate final timing report
     COMBINE_TIMING_REPORTS(timing_ch)
@@ -597,11 +833,24 @@ workflow {
     def qc_reports = Channel.empty()
         .mix(QC_CHECK_INPUT.out.report)
         .mix(QC_CHECK_EXTRACTED.out.report)
-        .mix(QC_CHECK_MERGED.out.report)
+        .mix(QC_CHECK_ANCIENT_MERGED.out.report)
+        .mix(QC_CHECK_FINAL_MERGED.out.report)
         .collect()
     
     // Add process to combine QC reports
     COMBINE_QC_REPORTS(qc_reports)
+
+    // Perform LD pruning on merged data
+    LD_PRUNE(MERGE_WITH_1KG.out.vcf)
+
+    // Run PCA on pruned data
+    RUN_PCA(LD_PRUNE.out.vcf)
+
+    // Create PCA plot using the sample info from PED file
+    CREATE_PCA_PLOT(
+        RUN_PCA.out.pca_results,
+        EXTRACT_SAMPLE_INFO.out.sample_info
+    )
 }
 
 // Add new process to combine QC reports
@@ -616,14 +865,19 @@ process COMBINE_QC_REPORTS {
 
     script:
     """
-    echo "Combined QC Report" > final_qc_report.txt
-    echo "Generated: \$(date)" >> final_qc_report.txt
-    echo "=========================" >> final_qc_report.txt
+    # Create header in a temporary file
+    echo "Combined QC Report" > temp_report.txt
+    echo "Generated: \$(date)" >> temp_report.txt
+    echo "=========================" >> temp_report.txt
     
+    # Append each QC report to the temporary file
     for report in *_qc_report.txt; do
-        echo "" >> final_qc_report.txt
-        cat \$report >> final_qc_report.txt
-        echo "-------------------------" >> final_qc_report.txt
+        echo "" >> temp_report.txt
+        cat \$report >> temp_report.txt
+        echo "-------------------------" >> temp_report.txt
     done
+
+    # Move temporary file to final output
+    mv temp_report.txt final_qc_report.txt
     """
 }
