@@ -164,9 +164,10 @@ tryCatch({
     stop("Failed to read sample info")
 })
 
-# Split into modern and ancient samples
+# Split into modern, ancient, and chachapoya samples
 ancient_samples <- pca[grepl("^ancient", pca$IID), ]
-modern_samples <- pca[!grepl("^ancient", pca$IID), ]
+chachapoya_samples <- pca[grepl("^SRR", pca$IID), ]
+modern_samples <- pca[!grepl("^ancient", pca$IID) & !grepl("^SRR", pca$IID), ]
 
 # Check if we have variation in the PCs
 for(pc in c("PC1", "PC2", "PC3")) {
@@ -224,6 +225,25 @@ create_pca_plot <- function(pc_x, pc_y, var_x, var_y) {
         }
     }
     
+    # Add chachapoya samples with orange triangles
+    if(nrow(chachapoya_samples) > 0) {
+        points(chachapoya_samples[[pc_x]], chachapoya_samples[[pc_y]],
+               pch=24,  # triangle with border
+               col="black",  # black border
+               bg="orange",  # orange fill
+               cex=2.5,    # larger size
+               lwd=1.5)    # thicker border
+        
+        # Add labels with white background and offset
+        text(chachapoya_samples[[pc_x]], chachapoya_samples[[pc_y]],
+             labels=chachapoya_samples$IID,
+             pos=4,     # position to the right of point
+             offset=1,  # add some space between point and text
+             cex=0.8,   # text size
+             bg="white", # white background for text
+             adj=0)     # left-align text
+    }
+    
     # Add ancient samples with enhanced visibility
     if(nrow(ancient_samples) > 0) {
         # Add white halos for better contrast against grey background
@@ -270,6 +290,13 @@ create_pca_plot <- function(pc_x, pc_y, var_x, var_y) {
         }
     }
     
+    # Add chachapoya samples to legend before ancient samples
+    if(nrow(chachapoya_samples) > 0) {
+        legend_entries <- c(legend_entries, "Chachapoya Samples")
+        legend_cols <- c(legend_cols, "orange")
+        legend_pchs <- c(legend_pchs, 24)  # match the triangle with border
+    }
+    
     # Add ancient samples at the end
     if(nrow(ancient_samples) > 0) {
         legend_entries <- c(legend_entries, "Ancient Samples")
@@ -304,4 +331,10 @@ log_message("PC3 variance explained:", pc3_var, "%")
 if(nrow(ancient_samples) > 0) {
     log_message("\nAncient Sample Coordinates:")
     print(ancient_samples[, c("IID", "PC1", "PC2", "PC3")])
+}
+
+# Print chachapoya sample coordinates
+if(nrow(chachapoya_samples) > 0) {
+    log_message("\nChachapoya Sample Coordinates:")
+    print(chachapoya_samples[, c("IID", "PC1", "PC2", "PC3")])
 }

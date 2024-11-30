@@ -4,7 +4,7 @@ nextflow.enable.dsl=2
 
 // Define parameters
 params.thousand_genomes_vcf = "/references/1000genomes/ALL.chr{chr}.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz"
-params.ancient_vcfs = "/project/1kg_nazca/data/ancient*.unifiedgenotyper.vcf.gz"
+params.ancient_vcfs_tsv = "ancient_vcfs.tsv"
 params.ped_file = "20130606_g1k.ped"
 params.outdir = 'results'
 params.min_maf = 0.01
@@ -18,6 +18,11 @@ params.timing_report = "${params.outdir}/timing_report.txt"
 params.min_variants = 50
 params.max_missing_rate = 0.1
 params.min_samples = 1
+params.admixture_k_min = 2
+params.admixture_k_max = 5
+params.admixture_cv = true  // Enable cross-validation
+params.admixture_threads = 16
+params.run_admixture = false  // Default to false
 
 // Helper function to expand chromosome list
 def expandChromosomeList(chrStr) {
@@ -34,7 +39,16 @@ def expandChromosomeList(chrStr) {
 }
 
 // Channel for ancient VCFs
-ancient_ch = Channel.fromPath(params.ancient_vcfs)
+ancient_ch = Channel.fromPath(params.ancient_vcfs_tsv)
+    .splitCsv(header: false, sep: '\t')
+    .map { row -> 
+        def vcf_path = file(row[0].trim())
+        if (!vcf_path.exists()) {
+            error "VCF file not found: ${vcf_path}"
+        }
+        return vcf_path
+    }
+    .view { "DEBUG: Ancient VCF loaded from TSV: $it" }
 
 // Create a process to extract sample information from 1000G VCF
 process EXTRACT_SAMPLE_INFO {
@@ -774,76 +788,183 @@ process CREATE_PCA_DATA_FILE {
 
     script:
     """
+    # Get the eigenvec and eigenval files from pca_results
+    pca_eigenvec=\$(find . -name "*.eigenvec")
+    pca_eigenval=\$(find . -name "*.eigenval")
+
+    Rscript ${baseDir}/bin/create_pca_json.R \
+        \$pca_eigenvec \
+        \$pca_eigenval \
+        ${sample_info} \
+        ${pop_info}
+    """
+}
+
+process RUN_ADMIXTURE {
+    publishDir "${params.outdir}/admixture", mode: 'copy'
+    cpus params.admixture_threads
+    
+    input:
+    path(bed_file)
+    path(bim_file)
+    path(fam_file)
+    val(k)
+    
+    output:
+    path("admixture_input.${k}.Q"), emit: q_files
+    path("admixture_input.${k}.P"), emit: p_files
+    path("log${k}.out"), emit: log
+    path("admixture_input.${k}.cv"), optional: true, emit: cv_error
+    
+    script:
+    def cv_flag = params.admixture_cv ? "--cv" : ""
+    """
+    # Run ADMIXTURE with cross-validation
+    admixture ${cv_flag} -j${task.cpus} -s ${k} ${bed_file} ${k} | tee log${k}.out
+    
+    # Debug output
+    echo "Contents of directory:"
+    ls -l
+    
+    # Check if Q file exists
+    if [ ! -f "admixture_input.${k}.Q" ]; then
+        echo "ERROR: Q file not generated"
+        exit 1
+    fi
+    """
+}
+
+process PREPARE_ADMIXTURE_INPUT {
+    publishDir "${params.outdir}/admixture", mode: 'copy'
+    
+    input:
+    path(vcf)
+    
+    output:
+    tuple path("admixture_input.bed"), 
+          path("admixture_input.bim"), 
+          path("admixture_input.fam"), emit: plink_files
+    
+    script:
+    """
+    # Convert VCF to PLINK format
+    plink2 --vcf ${vcf} \
+        --make-bed \
+        --out admixture_input \
+        --double-id \
+        --set-missing-var-ids '@:#:\\\$1,\\\$2' \
+        --new-id-max-allele-len 100 \
+        --max-alleles 2 \
+        --vcf-half-call m \
+        --allow-extra-chr \
+        --keep-allele-order
+
+    # Check if ancient samples are present
+    echo "Checking for ancient samples in output:"
+    grep "^ancient" admixture_input.fam || echo "No ancient samples found"
+    
+    # Count total samples
+    echo "Total samples in FAM file:"
+    wc -l admixture_input.fam
+    """
+}
+
+process PLOT_ADMIXTURE {
+    publishDir "${params.outdir}/admixture", mode: 'copy'
+    
+    input:
+    path(q_files)
+    path(sample_info)
+    path(pop_info)
+    
+    output:
+    path("admixture_plots*.png")
+    path("admixture_data.json")
+    
+    script:
+    """
+    # Debug: List input files
+    echo "Q files:"
+    ls -l *.Q
+    
+    echo "Sample info:"
+    ls -l ${sample_info}
+    
+    echo "Population info:"
+    ls -l ${pop_info}
+    
+    Rscript ${baseDir}/bin/plot_admixture.R \
+        --qfiles . \
+        --sample-info ${sample_info} \
+        --pop-info ${pop_info} \
+        --output-prefix admixture_plots
+    """
+}
+
+process ANALYZE_CV_ERROR {
+    publishDir "${params.outdir}/admixture", mode: 'copy'
+    
+    input:
+    path('*.cv')
+    
+    output:
+    path("cv_error_plot.pdf")
+    path("optimal_k.txt")
+    
+    script:
+    """
     #!/usr/bin/env Rscript
+    
+    # Read CV error files
+    cv_files <- list.files(pattern="*.cv")
+    cv_data <- lapply(cv_files, function(f) {
+        k <- as.numeric(sub(".*\\\\.(.*)\\.cv", "\\\\1", f))
+        cv_error <- as.numeric(readLines(f))
+        data.frame(K=k, CV_Error=cv_error)
+    })
+    cv_data <- do.call(rbind, cv_data)
+    
+    # Plot CV error
+    pdf("cv_error_plot.pdf")
+    plot(cv_data\$K, cv_data\$CV_Error, type="b",
+         xlab="K (number of ancestral populations)",
+         ylab="Cross-validation error",
+         main="Cross-validation error by K")
+    dev.off()
+    
+    # Find optimal K
+    optimal_k <- cv_data\$K[which.min(cv_data\$CV_Error)]
+    write(optimal_k, "optimal_k.txt")
+    """
+}
 
-    # Load required libraries
-    if (!requireNamespace("jsonlite", quietly = TRUE)) {
-        install.packages("jsonlite", repos="https://cloud.r-project.org")
-    }
-    library(jsonlite)
-
-    # Read PCA results - use pca.eigenvec file
-    pca <- read.table("pca.eigenvec", header=FALSE)
-    colnames(pca) <- c("FID", "IID", paste0("PC", 1:10))
-
-    # Read sample info
-    samples <- read.table("${sample_info}", header=TRUE, sep="\t")
-
-    # Read population info
-    pop_info <- read.delim("${pop_info}")
-
-    # Print column names for debugging
-    cat("Population info columns:", paste(colnames(pop_info), collapse=", "), "\n")
-
-    # Split modern and ancient samples
-    is_ancient <- grepl("^ancient", pca\$IID)
-    modern_pca <- pca[!is_ancient,]
-    ancient_pca <- pca[is_ancient,]
-
-    # Process modern samples
-    modern_pca\$IID <- gsub("_.*\$", "", modern_pca\$IID)
-    modern_data <- merge(modern_pca, samples, by.x="IID", by.y="Individual_ID", all.x=TRUE)
-    modern_data <- merge(modern_data, 
-                        pop_info[, c("Population.code", "Population.name", 
-                                    "Superpopulation.code", "Superpopulation.name",
-                                    "Superpopulation.display.colour")],
-                        by.x="Population", 
-                        by.y="Population.code", 
-                        all.x=TRUE)
-
-    # Create modern samples data structure
-    modern_final <- data.frame(
-        sample = modern_data\$IID,
-        population = modern_data\$Population,
-        pop_name = modern_data\$Population.name,
-        superpop = modern_data\$Superpopulation.code,
-        superpop_name = modern_data\$Superpopulation.name,
-        color = modern_data\$Superpopulation.display.colour,
-        is_ancient = FALSE,
-        PC1 = modern_data\$PC1,
-        PC2 = modern_data\$PC2,
-        PC3 = modern_data\$PC3
-    )
-
-    # Create ancient samples data structure
-    ancient_final <- data.frame(
-        sample = ancient_pca\$IID,
-        population = "Ancient",
-        pop_name = "Ancient Sample",
-        superpop = "ANC",
-        superpop_name = "Ancient Samples",
-        color = "#000000",  # Black color for ancient samples
-        is_ancient = TRUE,
-        PC1 = ancient_pca\$PC1,
-        PC2 = ancient_pca\$PC2,
-        PC3 = ancient_pca\$PC3
-    )
-
-    # Combine modern and ancient data
-    final_data <- rbind(modern_final, ancient_final)
-
-    # Write to JSON
-    writeLines(toJSON(final_data, pretty=TRUE), "pca_data.json")
+process CHECK_ADMIXTURE_INPUT {
+    publishDir "${params.outdir}/admixture/qc", mode: 'copy'
+    
+    input:
+    tuple path(bed), path(bim), path(fam)
+    
+    output:
+    path "admixture_input_qc.txt"
+    
+    script:
+    """
+    echo "ADMIXTURE Input QC Report" > admixture_input_qc.txt
+    echo "=========================" >> admixture_input_qc.txt
+    
+    echo -e "\nSample counts:" >> admixture_input_qc.txt
+    echo "Total samples: \$(wc -l < ${fam})" >> admixture_input_qc.txt
+    echo "Ancient samples: \$(grep -c '^ancient' ${fam})" >> admixture_input_qc.txt
+    echo "Modern samples: \$(grep -vc '^ancient' ${fam})" >> admixture_input_qc.txt
+    
+    echo -e "\nVariant counts:" >> admixture_input_qc.txt
+    echo "Total variants: \$(wc -l < ${bim})" >> admixture_input_qc.txt
+    
+    echo -e "\nFirst few samples:" >> admixture_input_qc.txt
+    head -n 5 ${fam} >> admixture_input_qc.txt
+    
+    echo -e "\nLast few samples:" >> admixture_input_qc.txt
+    tail -n 5 ${fam} >> admixture_input_qc.txt
     """
 }
 
@@ -860,8 +981,17 @@ workflow {
     }.view { "DEBUG: 1000G VCF for chr${it[0]}: ${it[1]}" }
 
     // Create ancient VCFs channel with debug view
-    def ancient_vcfs = Channel.fromPath(params.ancient_vcfs)
-        .view { "DEBUG: Ancient VCF before combine: $it" }
+    def ancient_vcfs = Channel
+        .fromPath(params.ancient_vcfs_tsv)
+        .splitCsv(header: false, sep: '\t')
+        .map { row -> 
+            def vcf_path = file(row[0].trim())
+            if (!vcf_path.exists()) {
+                error "VCF file not found: ${vcf_path}"
+            }
+            return vcf_path
+        }
+        .view { "DEBUG: Ancient VCF loaded from TSV: $it" }
 
     // Extract sample info from PED file
     EXTRACT_SAMPLE_INFO(
@@ -953,6 +1083,40 @@ workflow {
         EXTRACT_SAMPLE_INFO.out.sample_info,
         Channel.fromPath("${baseDir}/igsr_populations.tsv")
     )
+
+    // Only run ADMIXTURE analysis if flag is set
+    if (params.run_admixture) {
+        // After LD_PRUNE process, prepare input for ADMIXTURE
+        PREPARE_ADMIXTURE_INPUT(LD_PRUNE.out.vcf)
+        
+        // Add QC check for ADMIXTURE input
+        CHECK_ADMIXTURE_INPUT(PREPARE_ADMIXTURE_INPUT.out.plink_files)
+        
+        // Create channel for K values
+        admixture_k_ch = Channel.from(params.admixture_k_min..params.admixture_k_max)
+        
+        // Run ADMIXTURE for each K value
+        RUN_ADMIXTURE(
+            PREPARE_ADMIXTURE_INPUT.out.plink_files.map { bed, bim, fam -> bed },
+            PREPARE_ADMIXTURE_INPUT.out.plink_files.map { bed, bim, fam -> bim },
+            PREPARE_ADMIXTURE_INPUT.out.plink_files.map { bed, bim, fam -> fam },
+            admixture_k_ch
+        )
+        
+        // Analyze cross-validation error if enabled
+        if (params.admixture_cv) {
+            ANALYZE_CV_ERROR(
+                RUN_ADMIXTURE.out.cv_error.collect()
+            )
+        }
+        
+        // Plot ADMIXTURE results
+        PLOT_ADMIXTURE(
+            RUN_ADMIXTURE.out.q_files.collect(),
+            EXTRACT_SAMPLE_INFO.out.sample_info,
+            Channel.fromPath("${baseDir}/igsr_populations.tsv")
+        )
+    }
 }
 
 // Add new process to combine QC reports

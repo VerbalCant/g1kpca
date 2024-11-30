@@ -1,15 +1,26 @@
-# 1000 Genomes PCA Visualization Pipeline
+# 1000 Genomes PCA and Ancient DNA Analysis Pipeline
 
-This repository contains a Nextflow pipeline for performing Principal Component Analysis (PCA) on 1000 Genomes Project data combined with ancient DNA samples, along with an interactive 3D visualization tool.
+This repository contains Nextflow pipelines for:
+1. Performing Principal Component Analysis (PCA) on 1000 Genomes Project data combined with ancient DNA samples
+2. Running Schmutzi contamination analysis on ancient DNA samples
+3. Providing interactive 3D visualization tools for PCA results
 
 ## Pipeline Overview
 
-The pipeline:
-1. Processes VCF files from the 1000 Genomes Project
-2. Merges them with ancient DNA samples
-3. Performs LD pruning
-4. Runs PCA analysis
-5. Generates visualization data
+The repository contains two main workflows:
+
+### 1. PCA Pipeline (workflow.nf)
+- Processes VCF files from the 1000 Genomes Project
+- Merges them with ancient DNA samples
+- Performs LD pruning
+- Runs PCA analysis
+- Generates visualization data
+
+### 2. Schmutzi Pipeline (run_schmutzi.nf)
+- Analyzes mitochondrial DNA contamination in ancient samples
+- Prepares BAM files for analysis
+- Estimates contamination using deamination patterns
+- Generates contamination reports and consensus sequences
 
 ## Prerequisites
 
@@ -18,45 +29,82 @@ The pipeline:
 - Python 3 (for serving the visualization)
 - Modern web browser with WebGL support (for viewing the visualization)
 - Access to 1000 Genomes Project data
+- Schmutzi installation (for contamination analysis)
 
-## Running the Pipeline
+## Installation
 
 1. Clone this repository:
-```
-bash
+```bash
 git clone <repository-url>
 cd <repository-name>
 ```
 
-```
-bash
-git clone <repository-url>
-cd <repository-name>
+2. Install Schmutzi (if planning to use contamination analysis):
+```bash
+# Install to default location ($HOME/schmutzi)
+./install_schmutzi.sh
+
+# Or specify custom installation directory
+./install_schmutzi.sh --prefix /path/to/install
 ```
 
-2. Configure your input data in nextflow.config or provide parameters on the command line:
+## Running the Pipelines
 
-```
+### PCA Analysis Pipeline
+
+Configure your input data in nextflow.config or provide parameters on the command line:
+
+```bash
 nextflow run workflow.nf \
   --thousand_genomes_vcf "/path/to/1kg/*.vcf.gz" \
   --ancient_vcfs "/path/to/ancient/*.vcf.gz" \
   --outdir results
 ```
 
-The pipeline will generate several outputs in your results directory, including:
+### Schmutzi Contamination Analysis
+
+Run the Schmutzi workflow on your BAM files:
+
+```bash
+nextflow run run_schmutzi.nf \
+  --bams '/path/to/your/*.bam' \
+  --schmutzi_path "$SCHMUTZI_PATH" \
+  --outdir 'results_schmutzi' \
+  --library_type 'double' \
+  --length_deam 10
+```
+
+Key Schmutzi parameters:
+- `--bams`: Path pattern to your BAM files (required)
+- `--schmutzi_path`: Path to Schmutzi installation (required)
+- `--library_type`: Library type ('single' or 'double')
+- `--length_deam`: Length considered for deamination
+- `--contamination_prior`: Prior contamination estimate (optional)
+
+## Output Files
+
+### PCA Pipeline Output
 - `pca_data.json`: PCA coordinates and metadata for visualization
 - Various QC reports and intermediate files
 - PCA plots in PDF format
 
-## Visualizing the Results
+### Schmutzi Pipeline Output
+For each sample, creates a directory containing:
+- Initial contamination estimates
+- Final contamination estimates
+- Endogenous consensus sequence
+- Contaminant consensus sequence
+- Detailed analysis reports
+
+## Visualizing PCA Results
 
 1. Navigate to the directory containing pca_visualization.html and pca_data.json:
-```
+```bash
 cd results
 ```
 
 2. Serve the visualization using Python's HTTP server:
-```
+```bash
 python3 -m http.server 8080 --bind 0.0.0.0
 ```
 
@@ -65,7 +113,7 @@ python3 -m http.server 8080 --bind 0.0.0.0
 http://localhost:8080/pca_visualization.html
 ```
 
-## Using the visualization
+## Using the PCA Visualization
 The interactive 3D visualization offers several features:
 
 - Sample Types
@@ -98,17 +146,23 @@ Toggle between two coloring modes using radio buttons:
   - All controls update the visualization in real-time
 
 ## Troubleshooting
+
+### General Issues
 - If the visualization doesn't load, check your browser's console for errors
 - Ensure both pca_visualization.html and pca_data.json are in the same directory
 - Make sure your browser supports WebGL for 3D visualization
-- If you see CORS errors, ensure you're using a web server (like the Python command above) rather than opening the HTML file directly
-- For performance issues, try:
-  - Reducing the number of displayed populations
-  - Using the superpopulation coloring mode
-  - Using a more powerful computer/graphics card
+- If you see CORS errors, ensure you're using a web server rather than opening the HTML file directly
+
+### Schmutzi-specific Issues
+- Ensure BAM files are aligned to the rCRS reference
+- Check that BAM files are properly indexed
+- Verify Schmutzi installation with `schmutzi contDeam.pl --help`
+- For memory issues, try reducing the number of threads
+- Check the log files in the work directory for detailed error messages
 
 ## Citation
-If you use this pipeline in your research, please cite:
+If you use these pipelines in your research, please cite:
 - The 1000 Genomes Project
+- Schmutzi: Renaud G, Slon V, Duggan AT, Kelso J. Schmutzi: estimation of contamination and endogenous mitochondrial consensus calling for ancient DNA. Genome Biol. 2015
 - Plotly.js for visualization
 - This repository
