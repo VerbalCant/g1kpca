@@ -94,7 +94,8 @@
             'EAS': '#00FF00', // Green base for East Asian populations
             'SAS': '#FF00FF', // Magenta base for South Asian populations
             'AMR': '#FFA500', // Orange base for American populations
-            'ANC': '#000000'  // Black for ancient
+            'ANC': '#000000', // Black for ancient
+            'UNK': '#808080'  // Gray for unknown
         };
 
         // Generate colors for populations within each superpopulation
@@ -134,7 +135,8 @@
                 'PUR': '#FFD700', // Gold
                 'CLM': '#FF8C00', // Dark orange
                 'PEL': '#DAA520', // Goldenrod
-                'PEL': '#FFB833'  // Light orange
+                'PEL': '#FFB833',  // Light orange
+                'UNK': '#808080'  // Gray for unknown population
             };
             return colors;
         }
@@ -149,7 +151,18 @@
         fetch('pca_data.json')
             .then(response => response.json())
             .then(jsonData => {
-                data = jsonData;
+                data = jsonData.map(d => {
+                    if (!d.population && !d.is_ancient) {
+                        return {
+                            ...d,
+                            population: 'UNK',
+                            pop_name: 'Unknown',
+                            superpop: 'UNK',
+                            superpop_name: 'Unknown'
+                        };
+                    }
+                    return d;
+                });
                 
                 data.filter(d => !d.is_ancient).forEach(d => {
                     if (d.population) populations.add(d.population);
