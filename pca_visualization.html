@@ -277,6 +277,7 @@
                     if (popData.length === 0) return null;
                     
                     const popName = popData[0].pop_name;
+                    const isUnknown = pop === 'UNK';
                     
                     return {
                         name: `${pop} - ${popName}`,
@@ -286,9 +287,10 @@
                         mode: 'markers',
                         type: 'scatter3d',
                         marker: {
-                            size: 4,
-                            color: popColors[pop],
-                            opacity: 0.7
+                            size: isUnknown ? 12 : 4,
+                            color: isUnknown ? '#808080' : popColors[pop],
+                            opacity: 0.7,
+                            symbol: isUnknown ? 'triangle-up' : 'circle'
                         },
                         hovertext: popData.map(d => 
                             `Sample: ${d.sample}<br>` +
@@ -305,6 +307,7 @@
                     if (superpopData.length === 0) return null;
 
                     const superpopName = superpopData[0].superpop_name;
+                    const isUnknown = sp === 'UNK';
                     
                     return {
                         name: `${sp} - ${superpopName}`,
@@ -314,9 +317,10 @@
                         mode: 'markers',
                         type: 'scatter3d',
                         marker: {
-                            size: 4,
-                            color: superpopColors[sp],
-                            opacity: 0.7
+                            size: isUnknown ? 12 : 4,
+                            color: isUnknown ? '#808080' : superpopColors[sp],
+                            opacity: 0.7,
+                            symbol: isUnknown ? 'triangle-up' : 'circle'
                         },
                         hovertext: superpopData.map(d => 
                             `Sample: ${d.sample}<br>` +
@@ -338,9 +342,9 @@
                     mode: 'markers',
                     type: 'scatter3d',
                     marker: {
-                        size: 8,
+                        size: 12,  // Match UNK size
                         color: '#000000',
-                        symbol: 'diamond',
+                        symbol: 'triangle-up',  // Match UNK symbol
                         opacity: 1,
                         line: {
                             color: '#FFFFFF',
