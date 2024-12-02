@@ -7,21 +7,12 @@ This repository contains Nextflow pipelines for:
 
 ## Pipeline Overview
 
-The repository contains two main workflows:
-
-### 1. PCA Pipeline (workflow.nf)
+### PCA Pipeline (workflow.nf)
 - Processes VCF files from the 1000 Genomes Project
-- Merges them with ancient DNA samples
+- Merges them with hg19 VCFs
 - Performs LD pruning
 - Runs PCA analysis
-- Generates visualization data
-
-### 2. Schmutzi Pipeline (run_schmutzi.nf)
-- Analyzes mitochondrial DNA contamination in ancient samples
-- Prepares BAM files for analysis
-- Estimates contamination using deamination patterns
-- Generates contamination reports and consensus sequences
-
+- Generates 2D and visualization data
 ## Prerequisites
 
 - Nextflow (21.04.0 or later)
@@ -39,15 +30,6 @@ git clone <repository-url>
 cd <repository-name>
 ```
 
-2. Install Schmutzi (if planning to use contamination analysis):
-```bash
-# Install to default location ($HOME/schmutzi)
-./install_schmutzi.sh
-
-# Or specify custom installation directory
-./install_schmutzi.sh --prefix /path/to/install
-```
-
 ## Running the Pipelines
 
 ### PCA Analysis Pipeline
@@ -61,40 +43,12 @@ nextflow run workflow.nf \
   --outdir results
 ```
 
-### Schmutzi Contamination Analysis
-
-Run the Schmutzi workflow on your BAM files:
-
-```bash
-nextflow run run_schmutzi.nf \
-  --bams '/path/to/your/*.bam' \
-  --schmutzi_path "$SCHMUTZI_PATH" \
-  --outdir 'results_schmutzi' \
-  --library_type 'double' \
-  --length_deam 10
-```
-
-Key Schmutzi parameters:
-- `--bams`: Path pattern to your BAM files (required)
-- `--schmutzi_path`: Path to Schmutzi installation (required)
-- `--library_type`: Library type ('single' or 'double')
-- `--length_deam`: Length considered for deamination
-- `--contamination_prior`: Prior contamination estimate (optional)
-
 ## Output Files
 
 ### PCA Pipeline Output
 - `pca_data.json`: PCA coordinates and metadata for visualization
 - Various QC reports and intermediate files
 - PCA plots in PDF format
-
-### Schmutzi Pipeline Output
-For each sample, creates a directory containing:
-- Initial contamination estimates
-- Final contamination estimates
-- Endogenous consensus sequence
-- Contaminant consensus sequence
-- Detailed analysis reports
 
 ## Visualizing PCA Results
 
@@ -152,13 +106,6 @@ Toggle between two coloring modes using radio buttons:
 - Ensure both pca_visualization.html and pca_data.json are in the same directory
 - Make sure your browser supports WebGL for 3D visualization
 - If you see CORS errors, ensure you're using a web server rather than opening the HTML file directly
-
-### Schmutzi-specific Issues
-- Ensure BAM files are aligned to the rCRS reference
-- Check that BAM files are properly indexed
-- Verify Schmutzi installation with `schmutzi contDeam.pl --help`
-- For memory issues, try reducing the number of threads
-- Check the log files in the work directory for detailed error messages
 
 ## Citation
 If you use these pipelines in your research, please cite:
