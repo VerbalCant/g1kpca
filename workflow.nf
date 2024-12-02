@@ -2,28 +2,21 @@
 
 nextflow.enable.dsl=2
 
-// Define parameters
-params.thousand_genomes_vcf = "/references/1000genomes/ALL.chr{chr}.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz"
-params.ancient_vcfs_tsv = "ancient_vcfs.tsv"
-params.ped_file = "20130606_g1k.ped"
-params.outdir = 'results'
-params.min_maf = 0.01
-params.max_missing = 0.1
-params.ld_window_size = '50'
-params.ld_step_size = '10'
-params.ld_r2_threshold = '0.2'
-params.max_cpus = 16
-params.chromosomes = "1"  // Default to chr1, can be specified as "1,2,3" or "1-22"
-params.timing_report = "${params.outdir}/timing_report.txt"
-params.min_variants = 50
-params.max_missing_rate = 0.1
-params.min_samples = 1
-params.admixture_k_min = 2
-params.admixture_k_max = 5
-params.admixture_cv = true  // Enable cross-validation
-params.admixture_threads = 16
-params.run_admixture = false  // Default to false
-
+// Import modules
+include { extract_sample_info } from './modules/extract_sample_info'
+include { qc_check_input } from './modules/qc_check_input'
+include { merge_samples } from './modules/merge_samples'
+include { extract_chromosomes } from './modules/extract_chromosomes'
+include { qc_check_extracted } from './modules/qc_check_extracted'
+include { qc_check_samples_merged } from './modules/qc_check_samples_merged'
+include { merge_with_1000genomes } from './modules/merge_with_1000genomes'
+include { qc_check_final_merged } from './modules/qc_check_final_merged'
+include { combine_timing_reports } from './modules/combine_timing_reports'
+include { combine_qc_reports } from './modules/combine_qc_reports'
+include { ld_prune } from './modules/ld_prune'
+include { run_pca } from './modules/run_pca'
+include { create_pca_data_file } from './modules/create_pca_data_file'
+include { create_pca_plot } from './modules/create_pca_plot'
 // Helper function to expand chromosome list
 def expandChromosomeList(chrStr) {
     def chrList = []
@@ -49,924 +42,6 @@ ancient_ch = Channel.fromPath(params.ancient_vcfs_tsv)
         return vcf_path
     }
     .view { "DEBUG: Ancient VCF loaded from TSV: $it" }
-
-// Create a process to extract sample information from 1000G VCF
-process EXTRACT_SAMPLE_INFO {
-    publishDir params.outdir, mode: 'copy'
-
-    input:
-    path ped_file
-
-    output:
-    path 'samples.pop', emit: sample_info
-
-    script:
-    """
-    # Ensure clean tab-separated output with proper header
-    echo -e "Individual_ID\tPopulation" > samples.pop
-    awk -F'\t' 'NR > 1 {print \$2 "\t" \$7}' ${ped_file} | tr -s ' ' '\t' >> samples.pop
-    """
-}
-
-process EXTRACT_BIALLELIC_SNPS {
-    container 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
-    cpus params.max_cpus
-
-    input:
-    path vcf
-
-    output:
-    path "${vcf.baseName}.filtered.vcf.gz", emit: vcf
-
-    script:
-    """
-    bcftools view --threads ${task.cpus} \
-        -m2 -M2 -v snps \
-        --min-af ${params.min_maf}:minor \
-        ${vcf} \
-        -Oz -o "${vcf.baseName}.filtered.vcf.gz"
-
-    bcftools index --threads ${task.cpus} "${vcf.baseName}.filtered.vcf.gz"
-    """
-}
-
-process MERGE_ANCIENT_SAMPLES {
-    container 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
-    cpus params.max_cpus
-
-    input:
-    path vcfs
-
-    output:
-    path 'merged_ancient.vcf.gz', emit: vcf
-    path 'timing.txt', emit: timing
-
-    script:
-    """
-    start_time=\$(date +%s)
-    echo "Start time: \$(date)"
-    
-    # Create a directory for uniquely named links
-    mkdir -p unique_vcfs
-    
-    # Create uniquely named symbolic links
-    counter=1
-    for vcf in *.vcf.gz; do
-        unique_name="unique_vcfs/\${counter}_\${vcf}"
-        ln -s "../\${vcf}" "\${unique_name}"
-        echo "\${unique_name}" >> vcf_list.txt
-        counter=\$((counter + 1))
-    done
-
-    # Index VCF files only if they don't have an index
-    while read vcf; do
-        if [ ! -f \$vcf.tbi ] && [ ! -f \$vcf.csi ]; then
-            echo "Indexing \$vcf"
-            bcftools index --threads ${task.cpus} \$vcf
-        fi
-    done < vcf_list.txt
-
-    # Merge all ancient samples
-    echo "Command: bcftools merge --threads ${task.cpus} --file-list vcf_list.txt --missing-to-ref -Oz -o merged_ancient.vcf.gz"
-    bcftools merge \
-        --threads ${task.cpus} \
-        --file-list vcf_list.txt \
-        --missing-to-ref \
-        -Oz -o merged_ancient.vcf.gz
-
-    bcftools index --threads ${task.cpus} merged_ancient.vcf.gz
-
-    # End timing
-    end_time=\$(date +%s)
-    runtime=\$((end_time-start_time))
-    
-    # Write timing report
-    echo "Process: MERGE_ANCIENT_SAMPLES" > timing.txt
-    echo "Start time: \$(date -d @\${start_time})" >> timing.txt
-    echo "End time: \$(date -d @\${end_time})" >> timing.txt
-    echo "Runtime: \${runtime} seconds" >> timing.txt
-    echo "Command: bcftools merge --threads ${task.cpus} --file-list vcf_list.txt --missing-to-ref -Oz -o merged_ancient.vcf.gz" >> timing.txt
-    echo "Files merged:" >> timing.txt
-    cat vcf_list.txt >> timing.txt
-    echo "---" >> timing.txt
-    """
-}
-
-process MERGE_WITH_1KG {
-    container 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
-    cpus params.max_cpus
-
-    input:
-    path thousand_genomes_vcf
-    path ancient_vcf
-
-    output:
-    path 'merged_final.vcf.gz', emit: vcf
-    path 'timing.txt', emit: timing
-
-    script:
-    """
-    start_time=\$(date +%s)
-    
-    # Create local copy of 1000G VCF and index it
-    echo "Creating local copy of 1000G VCF..."
-    cp ${thousand_genomes_vcf} ./1kg.vcf.gz
-    
-    # Index both VCFs if needed
-    echo "Indexing VCFs..."
-    bcftools index --threads ${task.cpus} ./1kg.vcf.gz
-    
-    if [ ! -f ${ancient_vcf}.tbi ] && [ ! -f ${ancient_vcf}.csi ]; then
-        bcftools index --threads ${task.cpus} ${ancient_vcf}
-    fi
-
-    # Merge with 1000 Genomes
-    echo "Merging VCFs..."
-    bcftools merge \
-        --threads ${task.cpus} \
-        --missing-to-ref \
-        --regions ${params.chromosomes} \
-        -Oz -o merged_final.vcf.gz \
-        ./1kg.vcf.gz \
-        ${ancient_vcf}
-
-    bcftools index --threads ${task.cpus} merged_final.vcf.gz
-
-    # End timing
-    end_time=\$(date +%s)
-    runtime=\$((end_time-start_time))
-    
-    # Write timing report
-    echo "Process: MERGE_WITH_1KG" > timing.txt
-    echo "Start time: \$(date -d @\${start_time})" >> timing.txt
-    echo "End time: \$(date -d @\${end_time})" >> timing.txt
-    echo "Runtime: \${runtime} seconds" >> timing.txt
-    echo "Command: bcftools merge --threads ${task.cpus} --missing-to-ref --regions ${params.chromosomes} -Oz -o merged_final.vcf.gz" >> timing.txt
-    echo "1000G VCF: ${thousand_genomes_vcf}" >> timing.txt
-    echo "Ancient VCF: ${ancient_vcf}" >> timing.txt
-    """
-}
-
-process LD_PRUNE {
-    cpus params.max_cpus
-
-    input:
-    path vcf
-
-    output:
-    path 'pruned.vcf.gz', emit: vcf
-    path 'timing.txt', emit: timing
-
-    script:
-    """
-    start_time=\$(date +%s)
-    echo "Starting LD pruning at \$(date)"
-
-    # Index VCF if needed
-    if [ ! -f ${vcf}.tbi ] && [ ! -f ${vcf}.csi ]; then
-        echo "Indexing input VCF..."
-        bcftools index --tbi ${vcf}
-    fi
-
-    # Convert to plink format and perform LD pruning
-    echo "Step 1: LD pruning"
-    echo "Input VCF: ${vcf}"
-    ls -l ${vcf}
-    
-    # Filter out variants with long alleles using bcftools with expression
-    echo "Filtering variants with long alleles..."
-    bcftools view ${vcf} \
-        --include 'strlen(REF)<=100 & strlen(ALT)<=100' \
-        -Oz -o filtered_variants.vcf.gz
-
-    bcftools index filtered_variants.vcf.gz
-
-    # First pass: Convert to PLINK format with unique IDs
-    echo "Converting to PLINK format with unique IDs..."
-    plink2 --vcf filtered_variants.vcf.gz \
-        --threads ${task.cpus} \
-        --set-all-var-ids '@:#:\$r:\$a' \
-        --new-id-max-allele-len 97 \
-        --snps-only \
-        --max-alleles 2 \
-        --chr ${params.chromosomes} \
-        --make-bed \
-        --out temp_initial
-
-    # Now run LD pruning on the bed file
-    echo "Running LD pruning..."
-    plink2 --bfile temp_initial \
-        --threads ${task.cpus} \
-        --snps-only \
-        --indep-pairwise ${params.ld_window_size} ${params.ld_step_size} ${params.ld_r2_threshold} \
-        --out pruned
-
-    # Check if pruning was successful
-    if [ ! -f pruned.prune.in ]; then
-        echo "Error: LD pruning failed to produce output file"
-        exit 1
-    fi
-
-    # Extract pruned variants
-    echo "Step 2: Extracting pruned variants"
-    plink2 --bfile temp_initial \
-        --threads ${task.cpus} \
-        --extract pruned.prune.in \
-        --recode vcf bgz \
-        --out pruned \
-        --double-id
-
-    # End timing
-    end_time=\$(date +%s)
-    runtime=\$((end_time-start_time))
-    
-    # Write timing report
-    echo "Process: LD_PRUNE" > timing.txt
-    echo "Start time: \$(date -d @\${start_time})" >> timing.txt
-    echo "End time: \$(date -d @\${end_time})" >> timing.txt
-    echo "Runtime: \${runtime} seconds" >> timing.txt
-    echo "Parameters:" >> timing.txt
-    echo "  Window size: ${params.ld_window_size}" >> timing.txt
-    echo "  Step size: ${params.ld_step_size}" >> timing.txt
-    echo "  R2 threshold: ${params.ld_r2_threshold}" >> timing.txt
-    echo "Input VCF stats:" >> timing.txt
-    bcftools stats ${vcf} | grep "^SN" >> timing.txt
-    """
-}
-
-process RUN_PCA {
-    publishDir params.outdir, mode: 'copy'
-    cpus params.max_cpus
-
-    input:
-    path vcf
-
-    output:
-    path 'pca.*', emit: pca_results
-    path 'debug_*', emit: debug
-
-    script:
-    """
-    # First check input VCF
-    echo "Checking input VCF..."
-    bcftools stats ${vcf} > debug_vcf_stats.txt
-
-    # Convert VCF to PLINK format with minimal filtering first
-    echo "Converting to PLINK format..."
-    plink2 --vcf ${vcf} \
-        --threads ${task.cpus} \
-        --make-bed \
-        --allow-extra-chr \
-        --set-missing-var-ids @:#,\\\$1,\\\$2 \
-        --max-alleles 2 \
-        --out temp_plink_initial
-
-    # Check initial conversion
-    echo "Initial PLINK conversion stats:" > debug_plink_steps.txt
-    wc -l temp_plink_initial.bim >> debug_plink_steps.txt
-    wc -l temp_plink_initial.fam >> debug_plink_steps.txt
-
-    # Now do filtering steps one at a time
-    echo "Filtering steps:" >> debug_plink_steps.txt
-
-    # Step 1: Filter by missingness with a more lenient threshold
-    plink2 --bfile temp_plink_initial \
-        --threads ${task.cpus} \
-        --geno 0.2 \
-        --mind 0.2 \
-        --make-bed \
-        --out temp_plink_missing
-    echo "After missingness filtering:" >> debug_plink_steps.txt
-    wc -l temp_plink_missing.bim >> debug_plink_steps.txt
-
-    # Step 2: Filter by MAF with a much lower threshold
-    plink2 --bfile temp_plink_missing \
-        --threads ${task.cpus} \
-        --maf 0.001 \
-        --make-bed \
-        --out temp_plink_final
-    echo "After MAF filtering:" >> debug_plink_steps.txt
-    wc -l temp_plink_final.bim >> debug_plink_steps.txt
-
-    # Check the number of variants and samples
-    n_variants=\$(wc -l < temp_plink_final.bim)
-    n_samples=\$(wc -l < temp_plink_final.fam)
-    echo "Final counts:" >> debug_plink_steps.txt
-    echo "Variants: \$n_variants" >> debug_plink_steps.txt
-    echo "Samples: \$n_samples" >> debug_plink_steps.txt
-
-    if [ \$n_variants -lt ${params.min_variants} ]; then
-        echo "Error: Too few variants (\$n_variants) after filtering"
-        exit 1
-    fi
-
-    if [ \$n_samples -lt ${params.min_samples} ]; then
-        echo "Error: Too few samples (\$n_samples) after filtering"
-        exit 1
-    fi
-
-    # Run PCA with allele weights for multiallelic variants
-    plink2 --bfile temp_plink_final \
-        --threads ${task.cpus} \
-        --pca allele-wts approx \
-        --allow-extra-chr \
-        --out pca
-
-    # Verify PCA output
-    if [ ! -f pca.eigenvec ] || [ ! -f pca.eigenval ]; then
-        echo "Error: PCA failed to produce output files"
-        exit 1
-    fi
-
-    # Check eigenvalues
-    head -n 10 pca.eigenval > debug_eigenvalues.txt
-
-    # Check first few lines of eigenvectors
-    head -n 10 pca.eigenvec > debug_eigenvectors.txt
-
-    # Check for variation in eigenvectors
-    Rscript -e '
-        pca <- read.table("pca.eigenvec", header=TRUE)
-        pc1_var <- var(pca[,3])
-        pc2_var <- var(pca[,4])
-        cat(sprintf("PC1 variance: %g\\n", pc1_var), file="debug_pc_variance.txt")
-        cat(sprintf("PC2 variance: %g\\n", pc2_var), file="debug_pc_variance.txt")
-        if (pc1_var < 1e-10 || pc2_var < 1e-10) {
-            cat("Error: No variation in principal components\\n")
-            quit(status=1)
-        }
-    '
-    """
-}
-
-process CREATE_PCA_PLOT {
-    container 'quay.io/biocontainers/r-base:4.2.2'
-    publishDir params.outdir, mode: 'copy'
-
-    input:
-    path pca_results
-    path sample_info
-
-    output:
-    path '*_PC*.pdf'
-    path '*_debug.txt'
-
-    script:
-    """
-    Rscript ${baseDir}/bin/plot_pca.R \
-        --pca-file pca.eigenvec \
-        --eigenval-file pca.eigenval \
-        --sample-info ${sample_info} \
-        --pop-info ${baseDir}/igsr_populations.tsv \
-        --output-prefix pca_plot
-    """
-}
-
-process EXTRACT_CHROMOSOMES {
-    container 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
-    cpus params.max_cpus
-
-    input:
-    path vcf
-    val chromosome
-
-    output:
-    path "${vcf.baseName}.chr${chromosome}.vcf.gz", emit: vcf
-    path "timing_${task.index}.txt", emit: timing
-
-    script:
-    """
-    # Start timing
-    start_time=\$(date +%s)
-    echo "Start time: \$(date)"
-
-    # Index input VCF only if no index exists
-    if [ ! -f ${vcf}.tbi ] && [ ! -f ${vcf}.csi ]; then
-        echo "Indexing input VCF..."
-        bcftools index --threads ${task.cpus} ${vcf}
-    fi
-
-    # Extract chromosome
-    echo "Command: bcftools view --threads ${task.cpus} ${vcf} --regions ${chromosome} -Oz -o ${vcf.baseName}.chr${chromosome}.vcf.gz"
-    bcftools view --threads ${task.cpus} \
-        ${vcf} \
-        --regions ${chromosome} \
-        -Oz -o "${vcf.baseName}.chr${chromosome}.vcf.gz"
-
-    # Index output VCF only if no index exists
-    if [ ! -f "${vcf.baseName}.chr${chromosome}.vcf.gz.tbi" ] && [ ! -f "${vcf.baseName}.chr${chromosome}.vcf.gz.csi" ]; then
-        bcftools index --threads ${task.cpus} "${vcf.baseName}.chr${chromosome}.vcf.gz"
-    fi
-
-    # End timing
-    end_time=\$(date +%s)
-    runtime=\$((end_time-start_time))
-    
-    # Write timing report
-    echo "Process: EXTRACT_CHROMOSOMES" > timing_${task.index}.txt
-    echo "Input: ${vcf}" >> timing_${task.index}.txt
-    echo "Chromosome: ${chromosome}" >> timing_${task.index}.txt
-    echo "Start time: \$(date -d @\${start_time})" >> timing_${task.index}.txt
-    echo "End time: \$(date -d @\${end_time})" >> timing_${task.index}.txt
-    echo "Runtime: \${runtime} seconds" >> timing_${task.index}.txt
-    echo "Commands:" >> timing_${task.index}.txt
-    echo "  bcftools index --threads ${task.cpus} ${vcf}" >> timing_${task.index}.txt
-    echo "  bcftools view --threads ${task.cpus} ${vcf} --regions ${chromosome} -Oz -o ${vcf.baseName}.chr${chromosome}.vcf.gz" >> timing_${task.index}.txt
-    echo "---" >> timing_${task.index}.txt
-    """
-}
-
-process COMBINE_TIMING_REPORTS {
-    publishDir params.outdir, mode: 'copy'
-
-    input:
-    path 'timing_*.txt'
-
-    output:
-    path 'final_timing_report.txt'
-
-    script:
-    """
-    echo "Workflow Timing Report" > final_timing_report.txt
-    echo "Generated: \$(date)" >> final_timing_report.txt
-    echo "---" >> final_timing_report.txt
-    cat timing_*.txt >> final_timing_report.txt
-    """
-}
-
-// Create separate QC processes for each stage
-process QC_CHECK_INPUT {
-    container 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
-    cpus 1
-
-    input:
-    path vcf
-    val stage_name
-
-    output:
-    path "${stage_name}_qc_report.txt", emit: report
-    path "FAIL", optional: true, emit: fail_flag
-
-    script:
-    """
-    # Start QC report
-    echo "QC Report for ${stage_name}" > ${stage_name}_qc_report.txt
-    echo "VCF file: ${vcf}" >> ${stage_name}_qc_report.txt
-    echo "Date: \$(date)" >> ${stage_name}_qc_report.txt
-    echo "-------------------" >> ${stage_name}_qc_report.txt
-
-    # Index VCF only if no index exists
-    if [ ! -f ${vcf}.tbi ] && [ ! -f ${vcf}.csi ]; then
-        bcftools index --tbi ${vcf}
-    fi
-
-    # Check if file exists and is not empty
-    if [ ! -s ${vcf} ]; then
-        echo "ERROR: VCF file is empty" >> ${stage_name}_qc_report.txt
-        touch FAIL
-        exit 0
-    fi
-
-    # Get basic stats
-    echo "Basic Statistics:" >> ${stage_name}_qc_report.txt
-    bcftools stats ${vcf} | grep "^SN" >> ${stage_name}_qc_report.txt
-
-    # Get number of variants
-    variants=\$(bcftools view -H ${vcf} | wc -l)
-    echo "Number of variants: \$variants" >> ${stage_name}_qc_report.txt
-
-    # Get number of samples
-    samples=\$(bcftools query -l ${vcf} | wc -l)
-    echo "Number of samples: \$samples" >> ${stage_name}_qc_report.txt
-
-    # Check for minimum number of variants
-    if [ \$variants -lt ${params.min_variants} ]; then
-        echo "ERROR: Too few variants (\$variants < ${params.min_variants})" >> ${stage_name}_qc_report.txt
-        touch FAIL
-        exit 0
-    fi
-
-    # Check for minimum number of samples
-    if [ \$samples -lt ${params.min_samples} ]; then
-        echo "ERROR: No samples found in VCF" >> ${stage_name}_qc_report.txt
-        touch FAIL
-        exit 0
-    fi
-
-    # Check for biallelic sites
-    multiallelic=\$(bcftools view -H ${vcf} | cut -f 4,5 | grep ',' | wc -l)
-    echo "Number of multiallelic sites: \$multiallelic" >> ${stage_name}_qc_report.txt
-
-    # Check for variant types
-    echo "Variant types:" >> ${stage_name}_qc_report.txt
-    bcftools view -H ${vcf} | cut -f 4,5 | awk '{len1=length(\$1); len2=length(\$2); if(len1==1 && len2==1) print "SNP"; else if(len1>len2) print "DEL"; else if(len1<len2) print "INS"; else print "OTHER"}' | sort | uniq -c >> ${stage_name}_qc_report.txt
-
-    echo "QC check completed successfully" >> ${stage_name}_qc_report.txt
-    """
-}
-
-process QC_CHECK_EXTRACTED {
-    container 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
-    cpus 1
-
-    input:
-    path vcf
-    val stage_name
-
-    output:
-    path "${stage_name}_qc_report.txt", emit: report
-    path "FAIL", optional: true, emit: fail_flag
-
-    script:
-    """
-    # Start QC report
-    echo "QC Report for ${stage_name}" > ${stage_name}_qc_report.txt
-    echo "VCF file: ${vcf}" >> ${stage_name}_qc_report.txt
-    echo "Date: \$(date)" >> ${stage_name}_qc_report.txt
-    echo "-------------------" >> ${stage_name}_qc_report.txt
-
-    # Index VCF only if no index exists
-    if [ ! -f ${vcf}.tbi ] && [ ! -f ${vcf}.csi ]; then
-        bcftools index --tbi ${vcf}
-    fi
-
-    # Check if file exists and is not empty
-    if [ ! -s ${vcf} ]; then
-        echo "ERROR: VCF file is empty" >> ${stage_name}_qc_report.txt
-        touch FAIL
-        exit 0
-    fi
-
-    # Get basic stats
-    echo "Basic Statistics:" >> ${stage_name}_qc_report.txt
-    bcftools stats ${vcf} | grep "^SN" >> ${stage_name}_qc_report.txt
-
-    # Get number of variants
-    variants=\$(bcftools view -H ${vcf} | wc -l)
-    echo "Number of variants: \$variants" >> ${stage_name}_qc_report.txt
-
-    # Get number of samples
-    samples=\$(bcftools query -l ${vcf} | wc -l)
-    echo "Number of samples: \$samples" >> ${stage_name}_qc_report.txt
-
-    # Check for minimum number of variants
-    if [ \$variants -lt ${params.min_variants} ]; then
-        echo "ERROR: Too few variants (\$variants < ${params.min_variants})" >> ${stage_name}_qc_report.txt
-        touch FAIL
-        exit 0
-    fi
-
-    # Check for minimum number of samples
-    if [ \$samples -lt ${params.min_samples} ]; then
-        echo "ERROR: No samples found in VCF" >> ${stage_name}_qc_report.txt
-        touch FAIL
-        exit 0
-    fi
-
-    # Check for biallelic sites
-    multiallelic=\$(bcftools view -H ${vcf} | cut -f 4,5 | grep ',' | wc -l)
-    echo "Number of multiallelic sites: \$multiallelic" >> ${stage_name}_qc_report.txt
-
-    # Check for variant types
-    echo "Variant types:" >> ${stage_name}_qc_report.txt
-    bcftools view -H ${vcf} | cut -f 4,5 | awk '{len1=length(\$1); len2=length(\$2); if(len1==1 && len2==1) print "SNP"; else if(len1>len2) print "DEL"; else if(len1<len2) print "INS"; else print "OTHER"}' | sort | uniq -c >> ${stage_name}_qc_report.txt
-
-    echo "QC check completed successfully" >> ${stage_name}_qc_report.txt
-    """
-}
-
-process QC_CHECK_ANCIENT_MERGED {
-    container 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
-    cpus 1
-
-    input:
-    path vcf
-    val stage_name
-
-    output:
-    path "${stage_name}_qc_report.txt", emit: report
-    path "FAIL", optional: true, emit: fail_flag
-
-    script:
-    """
-    # Start QC report
-    echo "QC Report for ${stage_name}" > ${stage_name}_qc_report.txt
-    echo "VCF file: ${vcf}" >> ${stage_name}_qc_report.txt
-    echo "Date: \$(date)" >> ${stage_name}_qc_report.txt
-    echo "-------------------" >> ${stage_name}_qc_report.txt
-
-    # Index VCF only if no index exists
-    if [ ! -f ${vcf}.tbi ] && [ ! -f ${vcf}.csi ]; then
-        bcftools index --tbi ${vcf}
-    fi
-
-    # Check if file exists and is not empty
-    if [ ! -s ${vcf} ]; then
-        echo "ERROR: VCF file is empty" >> ${stage_name}_qc_report.txt
-        touch FAIL
-        exit 0
-    fi
-
-    # Get basic stats
-    echo "Basic Statistics:" >> ${stage_name}_qc_report.txt
-    bcftools stats ${vcf} | grep "^SN" >> ${stage_name}_qc_report.txt
-
-    # Get number of variants
-    variants=\$(bcftools view -H ${vcf} | wc -l)
-    echo "Number of variants: \$variants" >> ${stage_name}_qc_report.txt
-
-    # Get number of samples
-    samples=\$(bcftools query -l ${vcf} | wc -l)
-    echo "Number of samples: \$samples" >> ${stage_name}_qc_report.txt
-
-    # Check for minimum number of variants
-    if [ \$variants -lt ${params.min_variants} ]; then
-        echo "ERROR: Too few variants (\$variants < ${params.min_variants})" >> ${stage_name}_qc_report.txt
-        touch FAIL
-        exit 0
-    fi
-
-    # Check for minimum number of samples
-    if [ \$samples -lt ${params.min_samples} ]; then
-        echo "ERROR: Too few samples (\$samples < ${params.min_samples})" >> ${stage_name}_qc_report.txt
-        touch FAIL
-        exit 0
-    fi
-
-    # Check for biallelic sites
-    multiallelic=\$(bcftools view -H ${vcf} | cut -f 4,5 | grep ',' | wc -l)
-    echo "Number of multiallelic sites: \$multiallelic" >> ${stage_name}_qc_report.txt
-
-    # Check for variant types
-    echo "Variant types:" >> ${stage_name}_qc_report.txt
-    bcftools view -H ${vcf} | cut -f 4,5 | awk '{len1=length(\$1); len2=length(\$2); if(len1==1 && len2==1) print "SNP"; else if(len1>len2) print "DEL"; else if(len1<len2) print "INS"; else print "OTHER"}' | sort | uniq -c >> ${stage_name}_qc_report.txt
-
-    echo "QC check completed successfully" >> ${stage_name}_qc_report.txt
-    """
-}
-
-process QC_CHECK_FINAL_MERGED {
-    container 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
-    cpus 1
-
-    input:
-    path vcf
-    val stage_name
-
-    output:
-    path "${stage_name}_qc_report.txt", emit: report
-    path "FAIL", optional: true, emit: fail_flag
-
-    script:
-    """
-    # Start QC report
-    echo "QC Report for ${stage_name}" > ${stage_name}_qc_report.txt
-    echo "VCF file: ${vcf}" >> ${stage_name}_qc_report.txt
-    echo "Date: \$(date)" >> ${stage_name}_qc_report.txt
-    echo "-------------------" >> ${stage_name}_qc_report.txt
-
-    # Index VCF only if no index exists
-    if [ ! -f ${vcf}.tbi ] && [ ! -f ${vcf}.csi ]; then
-        bcftools index --tbi ${vcf}
-    fi
-
-    # Check if file exists and is not empty
-    if [ ! -s ${vcf} ]; then
-        echo "ERROR: VCF file is empty" >> ${stage_name}_qc_report.txt
-        touch FAIL
-        exit 0
-    fi
-
-    # Get basic stats
-    echo "Basic Statistics:" >> ${stage_name}_qc_report.txt
-    bcftools stats ${vcf} | grep "^SN" >> ${stage_name}_qc_report.txt
-
-    # Get number of variants
-    variants=\$(bcftools view -H ${vcf} | wc -l)
-    echo "Number of variants: \$variants" >> ${stage_name}_qc_report.txt
-
-    # Get number of samples
-    samples=\$(bcftools query -l ${vcf} | wc -l)
-    echo "Number of samples: \$samples" >> ${stage_name}_qc_report.txt
-
-    # Check for minimum number of variants
-    if [ \$variants -lt ${params.min_variants} ]; then
-        echo "ERROR: Too few variants (\$variants < ${params.min_variants})" >> ${stage_name}_qc_report.txt
-        touch FAIL
-        exit 0
-    fi
-
-    # Check for minimum number of samples
-    if [ \$samples -lt ${params.min_samples} ]; then
-        echo "ERROR: Too few samples (\$samples < ${params.min_samples})" >> ${stage_name}_qc_report.txt
-        touch FAIL
-        exit 0
-    fi
-
-    # Check for biallelic sites
-    multiallelic=\$(bcftools view -H ${vcf} | cut -f 4,5 | grep ',' | wc -l)
-    echo "Number of multiallelic sites: \$multiallelic" >> ${stage_name}_qc_report.txt
-
-    # Check for variant types
-    echo "Variant types:" >> ${stage_name}_qc_report.txt
-    bcftools view -H ${vcf} | cut -f 4,5 | awk '{len1=length(\$1); len2=length(\$2); if(len1==1 && len2==1) print "SNP"; else if(len1>len2) print "DEL"; else if(len1<len2) print "INS"; else print "OTHER"}' | sort | uniq -c >> ${stage_name}_qc_report.txt
-
-    echo "QC check completed successfully" >> ${stage_name}_qc_report.txt
-    """
-}
-
-process CREATE_PCA_DATA_FILE {
-    publishDir params.outdir, mode: 'copy'
-
-    input:
-    path(pca_results)
-    path(sample_info)
-    path(pop_info)
-
-    output:
-    path 'pca_data.json'
-
-    script:
-    """
-    # Get the eigenvec and eigenval files from pca_results
-    pca_eigenvec=\$(find . -name "*.eigenvec")
-    pca_eigenval=\$(find . -name "*.eigenval")
-
-    Rscript ${baseDir}/bin/create_pca_json.R \
-        \$pca_eigenvec \
-        \$pca_eigenval \
-        ${sample_info} \
-        ${pop_info}
-    """
-}
-
-process RUN_ADMIXTURE {
-    publishDir "${params.outdir}/admixture", mode: 'copy'
-    cpus params.admixture_threads
-    
-    input:
-    path(bed_file)
-    path(bim_file)
-    path(fam_file)
-    val(k)
-    
-    output:
-    path("admixture_input.${k}.Q"), emit: q_files
-    path("admixture_input.${k}.P"), emit: p_files
-    path("log${k}.out"), emit: log
-    path("admixture_input.${k}.cv"), optional: true, emit: cv_error
-    
-    script:
-    def cv_flag = params.admixture_cv ? "--cv" : ""
-    """
-    # Run ADMIXTURE with cross-validation
-    admixture ${cv_flag} -j${task.cpus} -s ${k} ${bed_file} ${k} | tee log${k}.out
-    
-    # Debug output
-    echo "Contents of directory:"
-    ls -l
-    
-    # Check if Q file exists
-    if [ ! -f "admixture_input.${k}.Q" ]; then
-        echo "ERROR: Q file not generated"
-        exit 1
-    fi
-    """
-}
-
-process PREPARE_ADMIXTURE_INPUT {
-    publishDir "${params.outdir}/admixture", mode: 'copy'
-    
-    input:
-    path(vcf)
-    
-    output:
-    tuple path("admixture_input.bed"), 
-          path("admixture_input.bim"), 
-          path("admixture_input.fam"), emit: plink_files
-    
-    script:
-    """
-    # Convert VCF to PLINK format
-    plink2 --vcf ${vcf} \
-        --make-bed \
-        --out admixture_input \
-        --double-id \
-        --set-missing-var-ids '@:#:\\\$1,\\\$2' \
-        --new-id-max-allele-len 100 \
-        --max-alleles 2 \
-        --vcf-half-call m \
-        --allow-extra-chr \
-        --keep-allele-order
-
-    # Check if ancient samples are present
-    echo "Checking for ancient samples in output:"
-    grep "^ancient" admixture_input.fam || echo "No ancient samples found"
-    
-    # Count total samples
-    echo "Total samples in FAM file:"
-    wc -l admixture_input.fam
-    """
-}
-
-process PLOT_ADMIXTURE {
-    publishDir "${params.outdir}/admixture", mode: 'copy'
-    
-    input:
-    path(q_files)
-    path(sample_info)
-    path(pop_info)
-    
-    output:
-    path("admixture_plots*.png")
-    path("admixture_data.json")
-    
-    script:
-    """
-    # Debug: List input files
-    echo "Q files:"
-    ls -l *.Q
-    
-    echo "Sample info:"
-    ls -l ${sample_info}
-    
-    echo "Population info:"
-    ls -l ${pop_info}
-    
-    Rscript ${baseDir}/bin/plot_admixture.R \
-        --qfiles . \
-        --sample-info ${sample_info} \
-        --pop-info ${pop_info} \
-        --output-prefix admixture_plots
-    """
-}
-
-process ANALYZE_CV_ERROR {
-    publishDir "${params.outdir}/admixture", mode: 'copy'
-    
-    input:
-    path('*.cv')
-    
-    output:
-    path("cv_error_plot.pdf")
-    path("optimal_k.txt")
-    
-    script:
-    """
-    #!/usr/bin/env Rscript
-    
-    # Read CV error files
-    cv_files <- list.files(pattern="*.cv")
-    cv_data <- lapply(cv_files, function(f) {
-        k <- as.numeric(sub(".*\\\\.(.*)\\.cv", "\\\\1", f))
-        cv_error <- as.numeric(readLines(f))
-        data.frame(K=k, CV_Error=cv_error)
-    })
-    cv_data <- do.call(rbind, cv_data)
-    
-    # Plot CV error
-    pdf("cv_error_plot.pdf")
-    plot(cv_data\$K, cv_data\$CV_Error, type="b",
-         xlab="K (number of ancestral populations)",
-         ylab="Cross-validation error",
-         main="Cross-validation error by K")
-    dev.off()
-    
-    # Find optimal K
-    optimal_k <- cv_data\$K[which.min(cv_data\$CV_Error)]
-    write(optimal_k, "optimal_k.txt")
-    """
-}
-
-process CHECK_ADMIXTURE_INPUT {
-    publishDir "${params.outdir}/admixture/qc", mode: 'copy'
-    
-    input:
-    tuple path(bed), path(bim), path(fam)
-    
-    output:
-    path "admixture_input_qc.txt"
-    
-    script:
-    """
-    echo "ADMIXTURE Input QC Report" > admixture_input_qc.txt
-    echo "=========================" >> admixture_input_qc.txt
-    
-    echo -e "\nSample counts:" >> admixture_input_qc.txt
-    echo "Total samples: \$(wc -l < ${fam})" >> admixture_input_qc.txt
-    echo "Ancient samples: \$(grep -c '^ancient' ${fam})" >> admixture_input_qc.txt
-    echo "Modern samples: \$(grep -vc '^ancient' ${fam})" >> admixture_input_qc.txt
-    
-    echo -e "\nVariant counts:" >> admixture_input_qc.txt
-    echo "Total variants: \$(wc -l < ${bim})" >> admixture_input_qc.txt
-    
-    echo -e "\nFirst few samples:" >> admixture_input_qc.txt
-    head -n 5 ${fam} >> admixture_input_qc.txt
-    
-    echo -e "\nLast few samples:" >> admixture_input_qc.txt
-    tail -n 5 ${fam} >> admixture_input_qc.txt
-    """
-}
 
 workflow {
     // Parse chromosome list and create debug view
@@ -994,14 +69,14 @@ workflow {
         .view { "DEBUG: Ancient VCF loaded from TSV: $it" }
 
     // Extract sample info from PED file
-    EXTRACT_SAMPLE_INFO(
-        Channel.fromPath("20130606_g1k.ped")
+    extract_sample_info(
+        Channel.fromPath(params.ped_file)
     )
 
     // QC and process ancient VCFs by chromosome
-    QC_CHECK_INPUT(ancient_vcfs, "input_ancient_vcfs")
+    qc_check_input(ancient_vcfs, "input_ancient_vcfs")
     
-    def qc_results = QC_CHECK_INPUT.out.report
+    def qc_results = qc_check_input.out.report
         .combine(ancient_vcfs)
         .branch {
             pass: !it[0].text.contains("ERROR")
@@ -1013,14 +88,14 @@ workflow {
         .combine(chromosomes)
         .view { "DEBUG: Combined channel: $it" }
 
-    EXTRACT_CHROMOSOMES(
+    extract_chromosomes(
         combined_ch.map { vcf, chr -> vcf },
         combined_ch.map { vcf, chr -> chr }
     )
     
-    QC_CHECK_EXTRACTED(EXTRACT_CHROMOSOMES.out.vcf, "post_extract_chromosomes")
+    qc_check_extracted(extract_chromosomes.out.vcf, "post_extract_chromosomes")
 
-    def grouped_vcfs = EXTRACT_CHROMOSOMES.out.vcf
+    def grouped_vcfs = extract_chromosomes.out.vcf
         .map { vcf -> 
             def chr = vcf.name.find(/chr(\d+)/)
             [chr, vcf]
@@ -1031,119 +106,56 @@ workflow {
             [chr, uniqueFiles]
         }
 
-    MERGE_ANCIENT_SAMPLES(
+    merge_samples(
         grouped_vcfs.map { chr, files -> files }
     )
 
-    QC_CHECK_ANCIENT_MERGED(MERGE_ANCIENT_SAMPLES.out.vcf, "post_merge_ancient")
+    qc_check_samples_merged(merge_samples.out.vcf, "post_merge_ancient")
 
     // Merge with 1000G by chromosome
-    MERGE_WITH_1KG(
+    merge_with_1000genomes(
         kg_vcf.map { chr, vcf -> vcf },
-        MERGE_ANCIENT_SAMPLES.out.vcf
+        merge_samples.out.vcf
     )
 
-    QC_CHECK_FINAL_MERGED(MERGE_WITH_1KG.out.vcf, "post_1kg_merge")
+    qc_check_final_merged(merge_with_1000genomes.out.vcf, "post_1kg_merge")
 
     // Collect timing reports
-    def timing_ch = EXTRACT_CHROMOSOMES.out.timing
-        .mix(MERGE_ANCIENT_SAMPLES.out.timing)
-        .mix(MERGE_WITH_1KG.out.timing)
+    def timing_ch = extract_chromosomes.out.timing
+        .mix(merge_samples.out.timing)
+        .mix(merge_with_1000genomes.out.timing)
         .collect()
 
     // Generate final timing report
-    COMBINE_TIMING_REPORTS(timing_ch)
+    combine_timing_reports(timing_ch)
 
     // Collect all QC reports
     def qc_reports = Channel.empty()
-        .mix(QC_CHECK_INPUT.out.report)
-        .mix(QC_CHECK_EXTRACTED.out.report)
-        .mix(QC_CHECK_ANCIENT_MERGED.out.report)
-        .mix(QC_CHECK_FINAL_MERGED.out.report)
+        .mix(qc_check_input.out.report)
+        .mix(qc_check_extracted.out.report)
+        .mix(qc_check_samples_merged.out.report)
+        .mix(qc_check_final_merged.out.report)
         .collect()
     
     // Add process to combine QC reports
-    COMBINE_QC_REPORTS(qc_reports)
+    combine_qc_reports(qc_reports)
 
     // Perform LD pruning on merged data
-    LD_PRUNE(MERGE_WITH_1KG.out.vcf)
+    ld_prune(merge_with_1000genomes.out.vcf)
 
     // Run PCA on pruned data
-    RUN_PCA(LD_PRUNE.out.vcf)
+    run_pca(ld_prune.out.vcf)
 
     // Create PCA plot using the sample info from PED file
-    CREATE_PCA_PLOT(
-        RUN_PCA.out.pca_results,
-        EXTRACT_SAMPLE_INFO.out.sample_info
+    create_pca_plot(
+        run_pca.out.pca_results,
+        extract_sample_info.out.sample_info
     )
 
     // Create PCA data file
-    CREATE_PCA_DATA_FILE(
-        RUN_PCA.out.pca_results,
-        EXTRACT_SAMPLE_INFO.out.sample_info,
+    create_pca_data_file(
+        run_pca.out.pca_results,
+        extract_sample_info.out.sample_info,
         Channel.fromPath("${baseDir}/igsr_populations.tsv")
     )
-
-    // Only run ADMIXTURE analysis if flag is set
-    if (params.run_admixture) {
-        // After LD_PRUNE process, prepare input for ADMIXTURE
-        PREPARE_ADMIXTURE_INPUT(LD_PRUNE.out.vcf)
-        
-        // Add QC check for ADMIXTURE input
-        CHECK_ADMIXTURE_INPUT(PREPARE_ADMIXTURE_INPUT.out.plink_files)
-        
-        // Create channel for K values
-        admixture_k_ch = Channel.from(params.admixture_k_min..params.admixture_k_max)
-        
-        // Run ADMIXTURE for each K value
-        RUN_ADMIXTURE(
-            PREPARE_ADMIXTURE_INPUT.out.plink_files.map { bed, bim, fam -> bed },
-            PREPARE_ADMIXTURE_INPUT.out.plink_files.map { bed, bim, fam -> bim },
-            PREPARE_ADMIXTURE_INPUT.out.plink_files.map { bed, bim, fam -> fam },
-            admixture_k_ch
-        )
-        
-        // Analyze cross-validation error if enabled
-        if (params.admixture_cv) {
-            ANALYZE_CV_ERROR(
-                RUN_ADMIXTURE.out.cv_error.collect()
-            )
-        }
-        
-        // Plot ADMIXTURE results
-        PLOT_ADMIXTURE(
-            RUN_ADMIXTURE.out.q_files.collect(),
-            EXTRACT_SAMPLE_INFO.out.sample_info,
-            Channel.fromPath("${baseDir}/igsr_populations.tsv")
-        )
-    }
-}
-
-// Add new process to combine QC reports
-process COMBINE_QC_REPORTS {
-    publishDir params.outdir, mode: 'copy'
-
-    input:
-    path '*_qc_report.txt'
-
-    output:
-    path 'final_qc_report.txt'
-
-    script:
-    """
-    # Create header in a temporary file
-    echo "Combined QC Report" > temp_report.txt
-    echo "Generated: \$(date)" >> temp_report.txt
-    echo "=========================" >> temp_report.txt
-    
-    # Append each QC report to the temporary file
-    for report in *_qc_report.txt; do
-        echo "" >> temp_report.txt
-        cat \$report >> temp_report.txt
-        echo "-------------------------" >> temp_report.txt
-    done
-
-    # Move temporary file to final output
-    mv temp_report.txt final_qc_report.txt
-    """
 }
