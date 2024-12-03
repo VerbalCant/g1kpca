@@ -1,6 +1,6 @@
 process merge_samples {
     container 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
-    cpus params.max_cpus
+    label 'high_cpu'
 
     input:
     tuple val(chr), path(vcfs)

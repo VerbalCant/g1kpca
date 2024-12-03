@@ -1,6 +1,7 @@
 process run_pca {
+    container 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
     publishDir params.outdir, mode: 'copy'
-    cpus params.max_cpus
+    label 'high_cpu'
 
     input:
     path vcf
@@ -10,15 +11,20 @@ process run_pca {
     path 'debug_*', emit: debug
 
     script:
+    def plink_mem_mb = (task.memory.toMega() * 0.8).intValue()
     """
+    echo "[DEBUG] Starting PCA analysis with ${task.cpus} CPUs and ${plink_mem_mb}MB memory"
+    echo "[DEBUG] Total available memory: ${task.memory}"
+
     # First check input VCF
     echo "Checking input VCF..."
-    bcftools stats ${vcf} > debug_vcf_stats.txt
+    bcftools stats --threads ${task.cpus} ${vcf} > debug_vcf_stats.txt
 
     # Convert VCF to PLINK format with minimal filtering first
     echo "Converting to PLINK format..."
     plink2 --vcf ${vcf} \
         --threads ${task.cpus} \
+        --memory ${plink_mem_mb} \
         --make-bed \
         --allow-extra-chr \
         --set-missing-var-ids @:#,\\\$1,\\\$2 \
@@ -36,6 +42,7 @@ process run_pca {
     # Step 1: Filter by missingness with a more lenient threshold
     plink2 --bfile temp_plink_initial \
         --threads ${task.cpus} \
+        --memory ${plink_mem_mb} \
         --geno 0.2 \
         --mind 0.2 \
         --make-bed \
@@ -46,6 +53,7 @@ process run_pca {
     # Step 2: Filter by MAF with a much lower threshold
     plink2 --bfile temp_plink_missing \
         --threads ${task.cpus} \
+        --memory ${plink_mem_mb} \
         --maf 0.001 \
         --make-bed \
         --out temp_plink_final
@@ -72,6 +80,7 @@ process run_pca {
     # Run PCA with allele weights for multiallelic variants
     plink2 --bfile temp_plink_final \
         --threads ${task.cpus} \
+        --memory ${plink_mem_mb} \
         --pca allele-wts approx \
         --allow-extra-chr \
         --out pca
@@ -100,5 +109,11 @@ process run_pca {
             quit(status=1)
         }
     '
+
+    # Add resource usage to debug output
+    echo "Resource Usage:" >> debug_plink_steps.txt
+    echo "  CPUs: ${task.cpus}" >> debug_plink_steps.txt
+    echo "  Memory: ${task.memory}" >> debug_plink_steps.txt
+    echo "  PLINK memory: ${plink_mem_mb}MB" >> debug_plink_steps.txt
     """
 }
