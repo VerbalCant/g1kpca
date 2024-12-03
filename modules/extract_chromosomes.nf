@@ -11,28 +11,41 @@ process extract_chromosomes {
     path "timing_${task.index}.txt", emit: timing
 
     script:
+    
+    def queryChrom = chromosome.toString().startsWith('chr') ? chromosome.toString().substring(3) : chromosome.toString()
     """
     # Start timing
     start_time=\$(date +%s)
-    echo "Start time: \$(date)"
+    echo "[DEBUG] Starting chromosome extraction process"
+    echo "[DEBUG] Input VCF: ${vcf}"
+    echo "[DEBUG] Target chromosome: ${chromosome}"
+    echo "[DEBUG] Query chromosome format: ${queryChrom}"
 
-    # Index input VCF only if no index exists
-    if [ ! -f ${vcf}.tbi ] && [ ! -f ${vcf}.csi ]; then
-        echo "Indexing input VCF..."
-        bcftools index --threads ${task.cpus} ${vcf}
-    fi
+    # First ensure input VCF is indexed
+    echo "[DEBUG] Creating index for input VCF"
+    bcftools index --tbi --force ${vcf}
 
-    # Extract chromosome
-    echo "Command: bcftools view --threads ${task.cpus} ${vcf} --regions ${chromosome} -Oz -o ${vcf.baseName}.chr${chromosome}.vcf.gz"
-    bcftools view --threads ${task.cpus} \
-        ${vcf} \
-        --regions ${chromosome} \
-        -Oz -o "${vcf.baseName}.chr${chromosome}.vcf.gz"
+    # List available chromosomes in input
+    echo "[DEBUG] Available chromosomes in input VCF:"
+    bcftools index --stats ${vcf}
 
-    # Index output VCF only if no index exists
-    if [ ! -f "${vcf.baseName}.chr${chromosome}.vcf.gz.tbi" ] && [ ! -f "${vcf.baseName}.chr${chromosome}.vcf.gz.csi" ]; then
-        bcftools index --threads ${task.cpus} "${vcf.baseName}.chr${chromosome}.vcf.gz"
-    fi
+    # Extract chromosome (using the converted chromosome format)
+    echo "[DEBUG] Extracting chromosome ${queryChrom}"
+    bcftools view \
+        --threads ${task.cpus} \
+        --regions ${queryChrom} \
+        --output-type z \
+        --output "${vcf.baseName}.chr${chromosome}.vcf.gz" \
+        ${vcf}
+
+    # Index output file
+    echo "[DEBUG] Indexing output VCF"
+    bcftools index --tbi "${vcf.baseName}.chr${chromosome}.vcf.gz"
+
+    # Verify output contents
+    echo "[DEBUG] Verifying output VCF contents:"
+    bcftools query -l "${vcf.baseName}.chr${chromosome}.vcf.gz" | wc -l
+    bcftools index --stats "${vcf.baseName}.chr${chromosome}.vcf.gz"
 
     # End timing
     end_time=\$(date +%s)
@@ -41,13 +54,9 @@ process extract_chromosomes {
     # Write timing report
     echo "Process: EXTRACT_CHROMOSOMES" > timing_${task.index}.txt
     echo "Input: ${vcf}" >> timing_${task.index}.txt
-    echo "Chromosome: ${chromosome}" >> timing_${task.index}.txt
+    echo "Chromosome: ${queryChrom}" >> timing_${task.index}.txt
     echo "Start time: \$(date -d @\${start_time})" >> timing_${task.index}.txt
     echo "End time: \$(date -d @\${end_time})" >> timing_${task.index}.txt
     echo "Runtime: \${runtime} seconds" >> timing_${task.index}.txt
-    echo "Commands:" >> timing_${task.index}.txt
-    echo "  bcftools index --threads ${task.cpus} ${vcf}" >> timing_${task.index}.txt
-    echo "  bcftools view --threads ${task.cpus} ${vcf} --regions ${chromosome} -Oz -o ${vcf.baseName}.chr${chromosome}.vcf.gz" >> timing_${task.index}.txt
-    echo "---" >> timing_${task.index}.txt
     """
 } 

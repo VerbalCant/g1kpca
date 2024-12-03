@@ -1,6 +1,6 @@
 process qc_check_extracted {
     container 'quay.io/biocontainers/bcftools:1.21--h8b25389_0'
-    cpus 1
+    cpus params.max_cpus
 
     input:
     path vcf
